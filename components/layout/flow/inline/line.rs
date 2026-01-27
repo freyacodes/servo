@@ -547,8 +547,12 @@ impl LineItemLayout<'_, '_> {
     }
 
     fn layout_text_run(&mut self, text_item: TextRunLineItem) {
-        if text_item.text.is_empty() {
-            return;
+        if let Some(rng) = text_item.selection_range {
+            println!("Hit! {:?}", rng);
+        }
+
+        if text_item.text.is_empty() && text_item.selection_range.is_none() {
+            //return;
         }
 
         let mut number_of_justification_opportunities = 0;

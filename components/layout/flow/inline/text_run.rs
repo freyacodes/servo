@@ -28,6 +28,7 @@ use xi_unicode::linebreak_property;
 use super::line_breaker::LineBreaker;
 use super::{InlineFormattingContextLayout, SharedInlineStyles};
 use crate::context::LayoutContext;
+use crate::flow::inline::TextRunLineItemInfo;
 use crate::fragment_tree::BaseFragmentInfo;
 
 // These constants are the xi-unicode line breaking classes that are defined in
@@ -133,32 +134,74 @@ impl TextRunSegment {
         }
 
         let mut byte_processed = ByteIndex(0);
+        println!("Glyph runs {}", self.runs.len());
         for (run_index, run) in self.runs.iter().enumerate() {
             ifc.possibly_flush_deferred_forced_line_break();
+            let is_last = self.runs.len() == run_index + 1;
 
             // If this whitespace forces a line break, queue up a hard line break the next time we
             // see any content. We don't line break immediately, because we'd like to finish processing
             // any ongoing inline boxes before ending the line.
-            if run.is_single_preserved_newline() {
+            if run.is_single_preserved_newline() && !is_last {
                 byte_processed = byte_processed + run.range.length();
                 ifc.defer_forced_line_break();
+                ifc.linebreak_info_before_new_content = Some(TextRunLineItemInfo {
+                    base_fragment_info: text_run.base_fragment_info,
+                    inline_styles: text_run.inline_styles.clone(),
+                    font: self.font.clone(),
+                    bidi_level: self.bidi_level,
+                    selection_range: text_run.selection_range,
+                    range: ServoRange::<ByteIndex>::new(
+                        byte_processed - ByteIndex(1) + ByteIndex(self.range.start as isize),
+                        ByteIndex(0),
+                    ),
+                });
                 continue;
             }
+
             // Break before each unbreakable run in this TextRun, except the first unless the
             // linebreaker was set to break before the first run.
             if run_index != 0 || soft_wrap_policy == SegmentStartSoftWrapPolicy::Force {
                 ifc.process_soft_wrap_opportunity();
             }
+
+            if run.is_single_preserved_newline() && is_last {
+                byte_processed = byte_processed + run.range.length();
+                ifc.push_glyph_store_to_unbreakable_segment(
+                    None,
+                    TextRunLineItemInfo {
+                        base_fragment_info: text_run.base_fragment_info,
+                        inline_styles: text_run.inline_styles.clone(),
+                        font: self.font.clone(),
+                        bidi_level: self.bidi_level,
+                        selection_range: text_run.selection_range,
+                        range: ServoRange::<ByteIndex>::new(
+                            byte_processed + ByteIndex(self.range.start as isize),
+                            ByteIndex(0),
+                        ),
+                    },
+                );
+                //ifc.current_line_segment.has_content = true;
+                //ifc.commit_current_segment_to_line();
+                //ifc.process_line_break(true /* forced_line_break */);
+                continue;
+            }
+
             ifc.push_glyph_store_to_unbreakable_segment(
-                run.glyph_store.clone(),
-                text_run,
-                &self.font,
-                self.bidi_level,
-                ServoRange::<ByteIndex>::new(
-                    byte_processed + ByteIndex(self.range.start as isize),
-                    run.range.length(),
-                ),
+                Some(run.glyph_store.clone()),
+                TextRunLineItemInfo {
+                    base_fragment_info: text_run.base_fragment_info,
+                    inline_styles: text_run.inline_styles.clone(),
+                    font: self.font.clone(),
+                    bidi_level: self.bidi_level,
+                    selection_range: text_run.selection_range,
+                    range: ServoRange::<ByteIndex>::new(
+                        byte_processed + ByteIndex(self.range.start as isize),
+                        run.range.length(),
+                    ),
+                },
             );
+
             byte_processed = byte_processed + run.range.length();
         }
     }
