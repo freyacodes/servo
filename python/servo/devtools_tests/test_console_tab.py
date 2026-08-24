@@ -190,6 +190,15 @@ class TestConsoleTab:
             assert not result["result"]
             assert result["exception"]
             assert "Not enough arguments" in result["exceptionMessage"]
+            preview = result["exception"]["preview"]
+            print("This is python")
+            print(result)
+            assert preview["columnNumber"]
+            assert preview["fileName"] == "debugger eval code"
+            assert preview["kind"] == "Error"
+            assert preview["lineNumber"] == 1
+            assert preview["message"]
+            assert preview["name"] == "TypeError"
 
     def test_global_autocomplete(self, run_servoshell):
         script_tag = "<script>console_test_value = 5;</script>"

@@ -360,7 +360,52 @@ previewers.Map = [ function MapPreviewer(object, depth) {
     }
 
     return preview;
-} ];
+}];
+
+// <https://searchfox.org/firefox-main/source/devtools/server/actors/object/previewers.js#1020>
+previewers.Error = [function ErrorPreviewer(obj, depth) {
+    // TODO: Conditionally invoke unsafe getters on "name" and "message" when eager eval is implemented
+    const name = getProperty(obj, "name");
+    const message = getProperty(obj, "message");
+    const stack = getProperty(obj, "stack");
+    const fileName = getProperty(obj, "fileName");
+    const lineNumber = getProperty(obj, "lineNumber");
+    const columnNumber = getProperty(obj, "columnNumber");
+
+    const preview = {
+        kind: "Error",
+        name: createValueGrip(name, depth),
+        message: createValueGrip(message, depth),
+        stack: createValueGrip(stack, depth),
+        fileName: createValueGrip(fileName, depth),
+        lineNumber: createValueGrip(lineNumber, depth),
+        columnNumber: createValueGrip(columnNumber, depth)
+    };
+
+    const errorHasCause = obj.getOwnPropertyNames().includes("cause");
+    if (errorHasCause) {
+        preview.cause = createValueGrip(
+            getProperty(obj, "cause"),
+            depth
+        );
+    }
+
+    return preview;
+}];
+
+// <https://searchfox.org/firefox-main/source/devtools/server/actors/object/previewers.js#31>
+previewers.TypeError = previewers.Error;
+previewers.EvalError = previewers.Error;
+previewers.RangeError = previewers.Error;
+previewers.ReferenceError = previewers.Error;
+previewers.SyntaxError = previewers.Error;
+previewers.URIError = previewers.Error;
+previewers.InternalError = previewers.Error;
+previewers.AggregateError = previewers.Error;
+previewers.CompileError = previewers.Error;
+previewers.DebuggeeWouldRun = previewers.Error;
+previewers.RuntimeError = previewers.Error;
+previewers.SuppressedError = previewers.Error;
 
 // Generic fallback for object previewer
 // <https://searchfox.org/mozilla-central/source/devtools/server/actors/object/previewers.js#856>
@@ -385,6 +430,7 @@ function getPreview(obj, depth) {
     for (const previewer of typePreviewers) {
         try {
             const result = previewer(obj, depth);
+            console.log("Preview result: ", result)
             if (result) return result;
         } catch (e) {
             console.error(`[debugger] Couldn't populate ${className} preview: ${e}`);
