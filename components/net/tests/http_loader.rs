@@ -27,18 +27,21 @@ use http::header::{self, HeaderMap, HeaderValue, WWW_AUTHENTICATE};
 use http::uri::Authority;
 use http::{HeaderName, Method, StatusCode};
 use http_body_util::combinators::BoxBody;
-use hyper::body::{Body, Bytes, Incoming};
+use http_body_util::{BodyExt, StreamBody};
+use hyper::body::{Body, Bytes, Frame, Incoming};
 use hyper::{Request as HyperRequest, Response as HyperResponse};
+use net::async_runtime::spawn_task;
 use net::cookie::ServoCookie;
 use net::cookie_storage::CookieStorage;
-use net::fetch::methods::{self};
+use net::fetch::methods::{self, CancellationListener};
 use net::http_loader::{determine_requests_referrer, serialize_origin};
 use net::resource_thread::AuthCacheEntry;
 use net::test::DECODER_BUFFER_SIZE;
+use net::test_util::{cancel_cancellation_listener, make_server_by_static_frames};
 use net_traits::blob_url_store::UrlWithBlobClaim;
 use net_traits::http_status::HttpStatus;
 use net_traits::request::{
-    CredentialsMode, Destination, Referrer, Request, RequestBuilder, RequestMode,
+    BackpressureMode, CredentialsMode, Destination, Referrer, Request, RequestBuilder, RequestMode,
     TraversableForUserPrompts, create_request_body_with_content,
 };
 use net_traits::response::{Response, ResponseBody};
@@ -46,6 +49,7 @@ use net_traits::{CookieSource, FetchTaskTarget, NetworkError, ReferrerPolicy, ge
 use parking_lot::{Mutex, RwLock};
 use servo_base::id::{TEST_PIPELINE_ID, TEST_WEBVIEW_ID};
 use servo_url::{ImmutableOrigin, ServoUrl};
+use tokio::sync::mpsc::UnboundedSender;
 use url::Url;
 
 use crate::{
@@ -751,7 +755,7 @@ fn test_load_doesnt_add_host_to_hsts_list_when_url_is_http_even_if_hsts_headers_
         .policy_container(Default::default())
         .build();
 
-    let mut context = new_fetch_context(None, None);
+    let mut context = new_fetch_context(None, None, None);
     let response = fetch_with_context(request, &mut context);
 
     let _ = server.close();
@@ -787,7 +791,7 @@ fn test_load_sets_cookies_in_the_resource_manager_when_it_get_set_cookie_header_
         };
     let (server, url) = make_server(handler);
 
-    let mut context = new_fetch_context(None, None);
+    let mut context = new_fetch_context(None, None, None);
 
     assert_cookie_for_domain(&context.state.cookie_jar, url.as_str(), None);
 
@@ -834,7 +838,7 @@ fn test_load_sets_requests_cookies_header_for_url_by_getting_cookies_from_the_re
         };
     let (server, url) = make_server(handler);
 
-    let mut context = new_fetch_context(None, None);
+    let mut context = new_fetch_context(None, None, None);
 
     {
         let mut cookie_jar = context.state.cookie_jar.write();
@@ -884,7 +888,7 @@ fn test_load_sends_cookie_if_nonhttp() {
         };
     let (server, url) = make_server(handler);
 
-    let mut context = new_fetch_context(None, None);
+    let mut context = new_fetch_context(None, None, None);
 
     {
         let mut cookie_jar = context.state.cookie_jar.write();
@@ -934,7 +938,7 @@ fn test_cookie_set_with_httponly_should_not_be_available_using_getcookiesforurl(
         };
     let (server, url) = make_server(handler);
 
-    let mut context = new_fetch_context(None, None);
+    let mut context = new_fetch_context(None, None, None);
 
     assert_cookie_for_domain(&context.state.cookie_jar, url.as_str(), None);
 
@@ -987,7 +991,7 @@ fn test_when_cookie_received_marked_secure_is_ignored_for_http() {
         };
     let (server, url) = make_server(handler);
 
-    let mut context = new_fetch_context(None, None);
+    let mut context = new_fetch_context(None, None, None);
 
     assert_cookie_for_domain(&context.state.cookie_jar, url.as_str(), None);
 
@@ -1410,7 +1414,7 @@ fn test_redirect_from_x_to_y_provides_y_cookies_from_y() {
     let url_y = ServoUrl::parse(&format!("http://mozilla.org:{}/org/", port)).unwrap();
     *shared_url_y_clone.lock() = Some(url_y.clone());
 
-    let mut context = new_fetch_context(None, None);
+    let mut context = new_fetch_context(None, None, None);
     {
         let mut cookie_jar = context.state.cookie_jar.write();
         let cookie_x = ServoCookie::new_wrapped(
@@ -1536,7 +1540,7 @@ fn test_if_auth_creds_not_in_url_but_in_cache_it_sets_it() {
         .policy_container(Default::default())
         .build();
 
-    let mut context = new_fetch_context(None, None);
+    let mut context = new_fetch_context(None, None, None);
 
     let auth_entry = AuthCacheEntry {
         user_name: "username".to_owned(),
@@ -1674,7 +1678,12 @@ fn test_fetch_compressed_response_update_count() {
         update_count: 0,
     };
     let response_update_count = spawn_blocking_task(async move {
-        methods::fetch(request, &mut target, &mut new_fetch_context(None, None)).await;
+        methods::fetch(
+            request,
+            &mut target,
+            &mut new_fetch_context(None, None, None),
+        )
+        .await;
         receiver.await.unwrap()
     });
 
@@ -1747,7 +1756,7 @@ fn test_user_credentials_prompt_when_proxy_authentication_is_required() {
         }),
     );
 
-    let mut context = new_fetch_context(None, Some(embedder_proxy));
+    let mut context = new_fetch_context(None, Some(embedder_proxy), None);
 
     let response = fetch_with_context(request, &mut context);
 
@@ -1804,7 +1813,7 @@ fn test_prompt_credentials_when_client_receives_unauthorized_response() {
             password: "test".into(),
         }),
     );
-    let mut context = new_fetch_context(None, Some(embedder_proxy));
+    let mut context = new_fetch_context(None, Some(embedder_proxy), None);
 
     let response = fetch_with_context(request, &mut context);
 
@@ -1860,7 +1869,7 @@ fn test_dont_prompt_credentials_when_unauthorized_response_contains_no_www_authe
             }
         }
     });
-    let mut context = new_fetch_context(None, Some(embedder_proxy));
+    let mut context = new_fetch_context(None, Some(embedder_proxy), None);
 
     let response = fetch_with_context(request, &mut context);
 
@@ -1907,7 +1916,7 @@ fn test_prompt_credentials_user_cancels_dialog_input() {
 
     let (embedder_proxy, embedder_receiver) = create_generic_embedder_proxy_and_receiver();
     let _ = receive_credential_prompt_msgs(embedder_receiver, None);
-    let mut context = new_fetch_context(None, Some(embedder_proxy));
+    let mut context = new_fetch_context(None, Some(embedder_proxy), None);
 
     let response = fetch_with_context(request, &mut context);
 
@@ -1960,7 +1969,7 @@ fn test_prompt_credentials_user_input_incorrect_credentials() {
             password: "test".into(),
         }),
     );
-    let mut context = new_fetch_context(None, Some(embedder_proxy));
+    let mut context = new_fetch_context(None, Some(embedder_proxy), None);
 
     let response = fetch_with_context(request, &mut context);
 
@@ -2013,7 +2022,7 @@ fn test_prompt_credentials_user_input_incorrect_mode() {
             password: "test".into(),
         }),
     );
-    let mut context = new_fetch_context(None, Some(embedder_proxy));
+    let mut context = new_fetch_context(None, Some(embedder_proxy), None);
 
     let response = fetch_with_context(request, &mut context);
 
@@ -2054,7 +2063,7 @@ fn test_security_info_for_https_connection() {
 
     let (devtools_sender, devtools_receiver) = unbounded();
 
-    let mut context = new_fetch_context(Some(devtools_sender), None);
+    let mut context = new_fetch_context(Some(devtools_sender), None, None);
 
     // The server certificate is self-signed, so we need to add an override
     // so that the connection works properly.
@@ -2136,7 +2145,7 @@ fn test_no_security_info_for_http_connection() {
         .policy_container(Default::default())
         .build();
 
-    let mut context = new_fetch_context(Some(devtools_sender), None);
+    let mut context = new_fetch_context(Some(devtools_sender), None, None);
 
     let response = fetch_with_context(request, &mut context);
     server.close();
@@ -2179,7 +2188,7 @@ fn test_stale_while_revalidate_serves_cached_and_revalidates_in_background() {
         };
     let (server, url) = make_server(handler);
 
-    let mut context = new_fetch_context(None, None);
+    let mut context = new_fetch_context(None, None, None);
 
     let build_request = || {
         RequestBuilder::new(None, url.clone(), Referrer::NoReferrer)
@@ -2211,4 +2220,239 @@ fn test_stale_while_revalidate_serves_cached_and_revalidates_in_background() {
     );
 
     let _ = server.close();
+}
+
+#[test]
+fn test_backpressure() {
+    let frames = vec!["foo", "bar", "baz", "qux"]
+        .into_iter()
+        .map(|s| Ok(Frame::data(Bytes::from(s))))
+        .collect();
+    let (_server, url) = make_server_by_static_frames(frames);
+    let (backpressure_sender, backpressure_receiver) =
+        tokio::sync::mpsc::unbounded_channel::<u64>();
+    let mut context = new_fetch_context(None, None, Some(backpressure_receiver));
+
+    let request = RequestBuilder::new(None, url.clone(), Referrer::NoReferrer)
+        .method(Method::GET)
+        .destination(Destination::Document)
+        .origin(url.clone().origin())
+        .pipeline_id(Some(TEST_PIPELINE_ID))
+        .policy_container(Default::default())
+        .backpressure_mode(BackpressureMode::Controlled {
+            initial_bytes: 3 * 3,
+        })
+        .build();
+
+    struct LockstepFetchTarget {
+        bytes_received: usize,
+        requested_more_bytes: bool,
+        expecting_remaining_bytes: Arc<AtomicBool>,
+        backpressure_sender: UnboundedSender<u64>,
+    }
+
+    impl FetchTaskTarget for LockstepFetchTarget {
+        fn process_request_body(&mut self, _: &Request) {}
+        fn process_response(&mut self, _: &Request, _: &Response) {}
+
+        fn process_response_chunk(&mut self, _: &Request, chunk: bytes::Bytes) {
+            println!("{}", String::from_utf8(chunk.to_vec()).unwrap());
+            self.bytes_received += chunk.len();
+            if !self.requested_more_bytes {
+                assert!(self.bytes_received <= 9);
+                if self.bytes_received == 9 {
+                    self.requested_more_bytes = true;
+                    let sender = self.backpressure_sender.clone();
+                    let expecting_remaining_bytes = self.expecting_remaining_bytes.clone();
+                    spawn_task(async move {
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        expecting_remaining_bytes.store(true, Ordering::Release);
+                        sender.send(u64::MAX).unwrap();
+                    });
+                }
+            } else if !self.expecting_remaining_bytes.load(Ordering::Acquire) {
+                panic!("Chunk arrived too early!")
+            }
+        }
+
+        fn process_response_eof(&mut self, _: &Request, response: &Response) {
+            assert_eq!(self.bytes_received, 12);
+            assert!(response.status.is_success());
+        }
+
+        fn process_csp_violations(&mut self, _: &Request, _: Vec<csp::Violation>) {}
+        fn process_response_length_hint(&mut self, _: &Request, _: usize) {}
+    }
+
+    let mut target = LockstepFetchTarget {
+        bytes_received: 0,
+        requested_more_bytes: false,
+        expecting_remaining_bytes: Arc::new(AtomicBool::new(false)),
+        backpressure_sender,
+    };
+
+    spawn_blocking_task(async move {
+        methods::fetch(request, &mut target, &mut context).await;
+    });
+}
+
+#[test]
+fn test_cancellation_amid_backpressure() {
+    let frames = vec!["1 sheep", "2 sheep", "3 sheep", "zzzzzZZZZ"]
+        .into_iter()
+        .map(|s| Ok(Frame::data(Bytes::from(s))))
+        .collect();
+    const EXPECTED_BYTES: usize = 7 * 3;
+    let (_server, url) = make_server_by_static_frames(frames);
+    let (_backpressure_sender, backpressure_receiver) =
+        tokio::sync::mpsc::unbounded_channel::<u64>();
+    let mut context = new_fetch_context(None, None, Some(backpressure_receiver));
+
+    let request = RequestBuilder::new(None, url.clone(), Referrer::NoReferrer)
+        .method(Method::GET)
+        .destination(Destination::Document)
+        .origin(url.clone().origin())
+        .pipeline_id(Some(TEST_PIPELINE_ID))
+        .policy_container(Default::default())
+        .backpressure_mode(BackpressureMode::Controlled {
+            initial_bytes: EXPECTED_BYTES as u64,
+        })
+        .build();
+
+    struct ImpatientFetchTarget {
+        bytes_received: usize,
+        cancellation_listener: Arc<CancellationListener>,
+    }
+
+    impl FetchTaskTarget for ImpatientFetchTarget {
+        fn process_request_body(&mut self, _: &Request) {}
+        fn process_response(&mut self, _: &Request, _: &Response) {}
+
+        fn process_response_chunk(&mut self, _: &Request, chunk: bytes::Bytes) {
+            self.bytes_received += chunk.len();
+            assert!(self.bytes_received <= EXPECTED_BYTES);
+            if self.bytes_received == EXPECTED_BYTES {
+                let cancellation_listener = self.cancellation_listener.clone();
+                spawn_task(async move {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    cancel_cancellation_listener(cancellation_listener.as_ref());
+                });
+            }
+        }
+
+        fn process_response_eof(&mut self, _: &Request, response: &Response) {
+            assert!(response.aborted.load(Ordering::Acquire));
+            assert_eq!(self.bytes_received, EXPECTED_BYTES);
+        }
+
+        fn process_csp_violations(&mut self, _: &Request, _: Vec<csp::Violation>) {}
+        fn process_response_length_hint(&mut self, _: &Request, _: usize) {}
+    }
+
+    let mut target = ImpatientFetchTarget {
+        bytes_received: 0,
+        cancellation_listener: context.cancellation_listener.clone(),
+    };
+
+    spawn_blocking_task(async move {
+        methods::fetch(request, &mut target, &mut context).await;
+    });
+}
+
+#[test]
+fn test_backpressure_following_redirect() {
+    const FIRST_HALF: &str = "You found ";
+    const SECOND_HALF: &str = "me!";
+
+    let late_init_url = Arc::new(Mutex::new(Option::<String>::None));
+    let late_init_url2 = late_init_url.clone();
+
+    let (_server, url) = make_server(move |request, response| {
+        println!("Path: {}", request.uri().path());
+        if request.uri().path() != "/destination" {
+            *response.status_mut() = StatusCode::MOVED_PERMANENTLY;
+            let first_url = late_init_url2.try_lock().unwrap().take().unwrap();
+            let destination_url = format!("{}destination", first_url);
+            let location_value = HeaderValue::from_str(&destination_url).unwrap();
+            response.headers_mut().insert("Location", location_value);
+            println!("First")
+        } else {
+            println!("Second");
+            let frames = vec![FIRST_HALF.to_owned(), SECOND_HALF.to_owned()]
+                .into_iter()
+                .map(|s| Ok(Frame::data(Bytes::from(s))));
+            let stream_body = StreamBody::new(tokio_stream::iter(frames));
+            *response.body_mut() = stream_body.boxed()
+        }
+    });
+
+    late_init_url.try_lock().unwrap().replace(url.to_string());
+
+    let (backpressure_sender, backpressure_receiver) =
+        tokio::sync::mpsc::unbounded_channel::<u64>();
+    let mut context = new_fetch_context(None, None, Some(backpressure_receiver));
+
+    let request = RequestBuilder::new(None, url.clone(), Referrer::NoReferrer)
+        .method(Method::GET)
+        .destination(Destination::Document)
+        .origin(url.clone().origin())
+        .pipeline_id(Some(TEST_PIPELINE_ID))
+        .policy_container(Default::default())
+        .backpressure_mode(BackpressureMode::Controlled {
+            initial_bytes: FIRST_HALF.len() as u64,
+        })
+        .build();
+
+    struct LockstepFetchTarget {
+        expected_next: Arc<Mutex<Option<String>>>,
+        backpressure_sender: UnboundedSender<u64>,
+        completed: bool,
+    }
+
+    impl FetchTaskTarget for LockstepFetchTarget {
+        fn process_request_body(&mut self, _: &Request) {}
+        fn process_response(&mut self, _: &Request, _: &Response) {}
+
+        fn process_response_chunk(&mut self, _: &Request, chunk: bytes::Bytes) {
+            let frame_string = String::from_utf8(chunk.to_vec()).unwrap();
+            let expected = self.expected_next.try_lock().unwrap().take();
+            assert_eq!(Some(&frame_string), expected.as_ref());
+            println!("Received {}", frame_string);
+
+            if Some(frame_string.as_str()) == Some(FIRST_HALF) {
+                let expected_next = self.expected_next.clone();
+                let backpressure_sender = self.backpressure_sender.clone();
+                spawn_task(async move {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    expected_next
+                        .try_lock()
+                        .unwrap()
+                        .replace(SECOND_HALF.to_string());
+                    backpressure_sender.send(u64::MAX)
+                });
+            } else {
+                assert_eq!(Some(frame_string.as_str()), Some(SECOND_HALF));
+                self.completed = true;
+            }
+        }
+
+        fn process_response_eof(&mut self, _: &Request, response: &Response) {
+            println!("{:?}", response.status);
+            println!("{:?}", response.get_network_error());
+            assert!(self.completed);
+        }
+
+        fn process_csp_violations(&mut self, _: &Request, _: Vec<csp::Violation>) {}
+        fn process_response_length_hint(&mut self, _: &Request, _: usize) {}
+    }
+
+    let mut target = LockstepFetchTarget {
+        expected_next: Arc::new(Mutex::new(Some(FIRST_HALF.to_string()))),
+        backpressure_sender,
+        completed: false,
+    };
+
+    spawn_blocking_task(async move {
+        methods::fetch(request, &mut target, &mut context).await;
+    });
 }
