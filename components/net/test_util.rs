@@ -11,8 +11,8 @@ use crossbeam_channel::unbounded;
 use embedder_traits::{EmbedderMsg, EmbedderProxy, EventLoopWaker, GenericEmbedderProxy};
 use futures::future::ready;
 use http_body_util::combinators::BoxBody;
-use http_body_util::{BodyExt, Empty, Full};
-use hyper::body::{Bytes, Incoming};
+use http_body_util::{BodyExt, Empty, Full, StreamBody};
+use hyper::body::{Bytes, Frame, Incoming};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Request as HyperRequest, Response as HyperResponse};
@@ -29,6 +29,7 @@ use tokio_rustls::{self, TlsAcceptor};
 use crate::async_runtime::{
     async_runtime_initialized, init_async_runtime, spawn_blocking_task, spawn_task,
 };
+use crate::fetch::methods::CancellationListener;
 pub use crate::hosts::replace_host_table;
 
 static CRT_FILE: &[u8] = include_bytes!("tests/self_signed_certificate_for_testing.crt");
@@ -147,6 +148,20 @@ where
     )
 }
 
+/// Create a server which blindly responds with the given frames on each request.
+/// Of particular relevance to backpressure tests.
+pub fn make_server_by_static_frames(
+    frames: Vec<Result<Frame<Bytes>, hyper::Error>>,
+) -> (Server, UrlWithBlobClaim) {
+    let frames_arc = Arc::new(Mutex::new(Some(frames)));
+
+    make_server(move |_request, response| {
+        let owned_vec = frames_arc.try_lock().unwrap().take().unwrap();
+        let stream_body = StreamBody::new(tokio_stream::iter(owned_vec));
+        *response.body_mut() = stream_body.boxed()
+    })
+}
+
 /// Given a path to a file containing PEM certificates, load and parse them into
 /// a vector of RusTLS [Certificate]s.
 fn load_certificates_from_pem() -> Result<Vec<CertificateDer<'static>>, Box<dyn std::error::Error>>
@@ -251,4 +266,8 @@ pub fn make_body(bytes: Vec<u8>) -> BoxBody<Bytes, hyper::Error> {
     Full::new(Bytes::from(bytes))
         .map_err(|_| unreachable!())
         .boxed()
+}
+
+pub fn cancel_cancellation_listener(listener: &CancellationListener) {
+    listener.cancel();
 }

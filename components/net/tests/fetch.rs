@@ -180,7 +180,7 @@ fn test_fetch_blob() {
         fn process_response_length_hint(&mut self, _: &Request, _: usize) {}
     }
 
-    let context = new_fetch_context(None, None);
+    let context = new_fetch_context(None, None, None);
 
     let bytes = b"content";
     let blob_buf = BlobBuf {
@@ -251,7 +251,7 @@ fn test_file() {
     .policy_container(Default::default())
     .build();
 
-    let mut context = new_fetch_context(None, None);
+    let mut context = new_fetch_context(None, None, None);
     let fetch_response = fetch_with_context(request, &mut context);
 
     // We should see an opaque-filtered response.
@@ -787,6 +787,7 @@ fn test_fetch_with_hsts() {
         file_token: FileTokenCheck::NotRequired,
         request_interceptor: Arc::new(TokioMutex::new(RequestInterceptor::new(embedder_proxy))),
         cancellation_listener: Arc::new(Default::default()),
+        backpressure_listener: Default::default(),
         protocols: Arc::new(ProtocolRegistry::default()),
         websocket_chan: None,
         ca_certificates: CACertificates::Default,
@@ -850,6 +851,7 @@ fn test_load_adds_host_to_hsts_list_when_url_is_https() {
         file_token: FileTokenCheck::NotRequired,
         request_interceptor: Arc::new(TokioMutex::new(RequestInterceptor::new(embedder_proxy))),
         cancellation_listener: Arc::new(Default::default()),
+        backpressure_listener: Default::default(),
         protocols: Arc::new(ProtocolRegistry::default()),
         websocket_chan: None,
         ca_certificates: CACertificates::Default,
@@ -918,6 +920,7 @@ fn test_fetch_self_signed() {
         file_token: FileTokenCheck::NotRequired,
         request_interceptor: Arc::new(TokioMutex::new(RequestInterceptor::new(embedder_proxy))),
         cancellation_listener: Arc::new(Default::default()),
+        backpressure_listener: Default::default(),
         protocols: Arc::new(ProtocolRegistry::default()),
         websocket_chan: None,
         ca_certificates: CACertificates::Default,
@@ -1301,7 +1304,7 @@ fn test_response_cache_status_is_local() {
         .build();
 
     // Use the same HttpCache for both fetches.
-    let mut context = new_fetch_context(None, None);
+    let mut context = new_fetch_context(None, None, None);
 
     // Cold request - response should come from the server.
     let initial_response = fetch_with_context(request.clone(), &mut context);
@@ -1342,7 +1345,7 @@ fn test_response_cache_status_is_validated() {
         .build();
 
     // Use the same HttpCache for both fetches.
-    let mut context = new_fetch_context(None, None);
+    let mut context = new_fetch_context(None, None, None);
 
     // Cold request - response should come from the server.
     let initial_response = fetch_with_context(request.clone(), &mut context);
@@ -1570,6 +1573,7 @@ fn test_fetch_request_intercepted() {
         file_token: FileTokenCheck::NotRequired,
         request_interceptor: Arc::new(TokioMutex::new(RequestInterceptor::new(embedder_proxy))),
         cancellation_listener: Arc::new(Default::default()),
+        backpressure_listener: Default::default(),
         protocols: Arc::new(ProtocolRegistry::default()),
         websocket_chan: None,
         ca_certificates: CACertificates::Default,
