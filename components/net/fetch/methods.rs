@@ -44,8 +44,8 @@ use serde::{Deserialize, Serialize};
 use servo_base::generic_channel::CallbackSetter;
 use servo_base::id::PipelineId;
 use servo_url::{Host, ServoUrl};
-use tokio::sync::Mutex as TokioMutex;
 use tokio::sync::mpsc::{UnboundedReceiver as TokioReceiver, UnboundedSender as TokioSender};
+use tokio::sync::{Mutex as TokioMutex, Notify};
 
 use crate::connector::CACertificates;
 use crate::devtools::{
@@ -118,6 +118,7 @@ pub struct FetchContext {
 #[derive(Default)]
 pub struct CancellationListener {
     cancelled: AtomicBool,
+    notify: Notify,
 }
 
 impl CancellationListener {
@@ -125,8 +126,16 @@ impl CancellationListener {
         self.cancelled.load(Ordering::Relaxed)
     }
 
+    pub(crate) async fn wait_for_cancellation(&self) {
+        let future = self.notify.notified();
+        if !self.cancelled() {
+            future.await;
+        }
+    }
+
     pub(crate) fn cancel(&self) {
-        self.cancelled.store(true, Ordering::Relaxed)
+        self.cancelled.store(true, Ordering::Relaxed);
+        self.notify.notify_waiters();
     }
 }
 
