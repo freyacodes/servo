@@ -106,6 +106,7 @@ pub struct FetchContext {
     pub file_token: FileTokenCheck,
     pub request_interceptor: Arc<TokioMutex<RequestInterceptor>>,
     pub cancellation_listener: Arc<CancellationListener>,
+    pub backpressure_listener: Arc<Mutex<Option<TokioReceiver<u64>>>>,
     pub timing: ResourceFetchTimingContainer,
     pub protocols: Arc<ProtocolRegistry>,
     pub websocket_chan: Option<Arc<Mutex<WebSocketChannel>>>,

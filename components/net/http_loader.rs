@@ -2385,6 +2385,7 @@ async fn http_network_fetch(
                     _ => vec![],
                 };
                 // This allocation may be retained by the http-cache.
+                // TODO: Find a solution
                 completed_body.shrink_to_fit();
                 // If devtools is disabled avoid cloning, since the result would
                 // be unused anyway.

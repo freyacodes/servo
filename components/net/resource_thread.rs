@@ -22,7 +22,9 @@ use malloc_size_of_derive::MallocSizeOf;
 use net_traits::blob_url_store::{BlobTokenCommunicator, parse_blob_url};
 use net_traits::filemanager_thread::FileTokenCheck;
 use net_traits::pub_domains::public_suffix_list_size_of;
-use net_traits::request::{Destination, PreloadEntry, PreloadId, RequestBuilder, RequestId};
+use net_traits::request::{
+    BackpressureMode, Destination, PreloadEntry, PreloadId, RequestBuilder, RequestId,
+};
 use net_traits::response::{Response, ResponseInit};
 use net_traits::{
     AsyncRuntime, CookieAsyncResponse, CookieData, CookieSource, CoreResourceMsg,
@@ -49,6 +51,7 @@ use servo_base::generic_channel::{
 use servo_base::id::CookieStoreId;
 use servo_url::{ImmutableOrigin, ServoUrl};
 use tokio::sync::Mutex as TokioMutex;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 use crate::async_runtime::{init_async_runtime, spawn_task};
 use crate::connector::{
@@ -165,6 +168,7 @@ pub fn new_core_resource_thread(
                 ca_certificates,
                 ignore_certificate_errors,
                 cancellation_listeners: Default::default(),
+                backpressure_channels: Default::default(),
                 cookie_listeners: Default::default(),
             };
 
@@ -195,6 +199,7 @@ struct ResourceChannelManager {
     ca_certificates: CACertificates<'static>,
     ignore_certificate_errors: bool,
     cancellation_listeners: FxHashMap<RequestId, Weak<CancellationListener>>,
+    backpressure_channels: FxHashMap<RequestId, UnboundedSender<u64>>,
     cookie_listeners: FxHashMap<CookieStoreId, GenericCallback<CookieAsyncResponse>>,
 }
 
@@ -386,6 +391,27 @@ impl ResourceChannelManager {
         cancellation_listener
     }
 
+    fn backpressure_sender(&self, request_id: RequestId) -> Option<&UnboundedSender<u64>> {
+        self.backpressure_channels.get(&request_id)
+    }
+
+    fn maybe_create_backpressure_channel(
+        &mut self,
+        request_id: RequestId,
+        backpressure_mode: BackpressureMode,
+    ) -> Option<UnboundedReceiver<u64>> {
+        if backpressure_mode == BackpressureMode::Disabled {
+            return None;
+        }
+
+        self.backpressure_channels
+            .retain(|_, sender| !sender.is_closed());
+
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        self.backpressure_channels.insert(request_id, sender);
+        Some(receiver)
+    }
+
     fn send_cookie_response(&self, store_id: CookieStoreId, data: CookieData) {
         let Some(sender) = self.cookie_listeners.get(&store_id) else {
             warn!(
@@ -412,12 +438,18 @@ impl ResourceChannelManager {
                 FetchChannels::ResponseMsg(sender) => {
                     let cancellation_listener =
                         self.get_or_create_cancellation_listener(request_builder.id);
+                    let backpressure_listener = self.maybe_create_backpressure_channel(
+                        request_builder.id,
+                        request_builder.backpressure_mode,
+                    );
+
                     self.resource_manager.fetch(
                         request_builder,
                         None,
                         sender,
                         http_state,
                         cancellation_listener,
+                        backpressure_listener,
                         protocols,
                     );
                 },
@@ -443,6 +475,7 @@ impl ResourceChannelManager {
                     DiscardFetch,
                     http_state,
                     Arc::new(Default::default()),
+                    None,
                     protocols,
                 ),
             },
@@ -452,6 +485,11 @@ impl ResourceChannelManager {
                     .filter_map(|request_id| self.cancellation_listener(request_id))
                 {
                     cancellation_listener.cancel();
+                }
+            },
+            CoreResourceMsg::SetResponseBackpressure(request_id, num_bytes) => {
+                if let Some(sender) = self.backpressure_sender(request_id) {
+                    let _ = sender.send(num_bytes);
                 }
             },
             CoreResourceMsg::DeleteCookiesForSites(sites, sender) => {
@@ -492,12 +530,17 @@ impl ResourceChannelManager {
             CoreResourceMsg::FetchRedirect(request_builder, res_init, sender) => {
                 let cancellation_listener =
                     self.get_or_create_cancellation_listener(request_builder.id);
+                let backpressure_listener = self.maybe_create_backpressure_channel(
+                    request_builder.id,
+                    request_builder.backpressure_mode,
+                );
                 self.resource_manager.fetch(
                     request_builder,
                     Some(res_init),
                     sender,
                     http_state,
                     cancellation_listener,
+                    backpressure_listener,
                     protocols,
                 )
             },
@@ -779,6 +822,7 @@ impl CoreResourceManager {
         }
     }
 
+    #[expect(clippy::too_many_arguments)]
     fn fetch<Target: 'static + FetchTaskTarget + Send>(
         &self,
         request_builder: RequestBuilder,
@@ -786,6 +830,7 @@ impl CoreResourceManager {
         mut sender: Target,
         http_state: &Arc<HttpState>,
         cancellation_listener: Arc<CancellationListener>,
+        backpressure_listener: Option<UnboundedReceiver<u64>>,
         protocols: Arc<ProtocolRegistry>,
     ) {
         let http_state = http_state.clone();
@@ -846,6 +891,7 @@ impl CoreResourceManager {
                 file_token,
                 request_interceptor: Arc::new(TokioMutex::new(request_interceptor)),
                 cancellation_listener,
+                backpressure_listener: Arc::new(Mutex::new(backpressure_listener)),
                 timing: ResourceFetchTiming::new(request.timing_type()).into(),
                 protocols,
                 websocket_chan: None,
@@ -942,6 +988,7 @@ impl CoreResourceManager {
                         file_token: FileTokenCheck::NotRequired,
                         request_interceptor: Arc::new(TokioMutex::new(request_interceptor)),
                         cancellation_listener,
+                        backpressure_listener: Default::default(),
                         timing: ResourceFetchTiming::new(request.timing_type()).into(),
                         protocols: protocols.clone(),
                         websocket_chan: Some(Arc::new(Mutex::new(WebSocketChannel::new(

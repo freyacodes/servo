@@ -766,6 +766,8 @@ pub enum FetchChannels {
 pub enum CoreResourceMsg {
     Fetch(RequestBuilder, FetchChannels),
     Cancel(Vec<RequestId>),
+    /// Set the minimum number of bytes to be sent before response reading is suspended
+    SetResponseBackpressure(RequestId, u64),
     /// Initiate a fetch in response to processing a redirection
     FetchRedirect(
         RequestBuilder,

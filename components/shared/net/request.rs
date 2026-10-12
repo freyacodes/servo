@@ -143,6 +143,18 @@ pub enum InternalRequest {
     No,
 }
 
+/// Servo-internal. Indicates whether fetch of the HTTP response body is throttled.
+#[derive(Clone, Copy, Debug, Deserialize, MallocSizeOf, PartialEq, Serialize)]
+pub enum BackpressureMode {
+    /// Bytes are forwarded to the fetch target as soon as possible.
+    Disabled,
+    /// Indicates that the fetch will be suspended after a limit of body bytes have been
+    /// sent to the fetch target. The limit is initially initial_bytes. The limit can be
+    /// set with [`net_traits::CoreResourceMsg::SetResponseBackpressure`]
+    Controlled { initial_bytes: u64 },
+    // TODO: Document how to request bytes
+}
+
 /// <https://html.spec.whatwg.org/multipage/#preload-key>
 #[derive(Clone, Debug, Eq, Hash, Deserialize, MallocSizeOf, Serialize, PartialEq)]
 pub struct PreloadKey {
@@ -520,6 +532,9 @@ pub struct RequestBuilder {
     pub crash: Option<String>,
     /// Servo internal: whether this request originates from Servo internal implementation
     pub is_internal_request: InternalRequest,
+
+    /// Servo internal: Whether the response body is potentially throttled
+    pub backpressure_mode: BackpressureMode,
 }
 
 impl RequestBuilder {
@@ -563,6 +578,7 @@ impl RequestBuilder {
             response_tainting: ResponseTainting::Basic,
             is_internal_request: Default::default(),
             crash: None,
+            backpressure_mode: BackpressureMode::Disabled,
         }
     }
 
@@ -729,6 +745,11 @@ impl RequestBuilder {
         self
     }
 
+    pub fn backpressure_mode(mut self, backpressure_mode: BackpressureMode) -> RequestBuilder {
+        self.backpressure_mode = backpressure_mode;
+        self
+    }
+
     pub fn build(self) -> Request {
         let mut request = Request::new(
             self.id,
@@ -775,6 +796,7 @@ impl RequestBuilder {
         request.client = self.client;
         request.policy_container = self.policy_container;
         request.is_internal_request = self.is_internal_request;
+        request.backpressure_mode = self.backpressure_mode;
         request
     }
 
@@ -863,6 +885,8 @@ pub struct Request {
     pub crash: Option<String>,
     /// Servo internal: whether this request originates from Servo internal implementation
     pub is_internal_request: InternalRequest,
+    /// Servo internal: Whether the response body is potentially throttled
+    pub backpressure_mode: BackpressureMode,
 }
 
 impl Request {
@@ -911,6 +935,7 @@ impl Request {
             policy_container: RequestPolicyContainer::Client,
             is_internal_request: Default::default(),
             crash: None,
+            backpressure_mode: BackpressureMode::Disabled,
         }
     }
 
