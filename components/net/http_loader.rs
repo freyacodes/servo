@@ -2370,11 +2370,8 @@ async fn http_network_fetch(
     };
 
     let done_sender2 = done_sender.clone();
-    let done_sender3 = done_sender.clone();
     let timing_ptr2 = fetch_params.timing_info.clone();
-    let timing_ptr3 = fetch_params.timing_info.clone();
-    let url1 = request.url();
-    let url2 = url1.clone();
+    let url2 = request.url();
 
     let prealloc_size: usize = if let Some(possible_length) = response_stream
         .headers()
@@ -2400,27 +2397,33 @@ async fn http_network_fetch(
     *response_body.lock() = ResponseBody::Receiving(Vec::with_capacity(prealloc_size));
     let response_body2 = response_body.clone();
 
-    spawn_task(
-        response_stream
-            .into_body()
-            .try_fold(response_body, move |response_body_accumulator, chunk| {
+    spawn_task(async move {
+        let mut body_stream = response_stream.into_body();
+
+        let result: Result<(), std::io::Error> = async move {
+            while let Some(chunk) = body_stream.try_next().await? {
                 if cancellation_listener.cancelled() {
-                    *response_body_accumulator.lock() = ResponseBody::Done(vec![]);
+                    *response_body.lock() = ResponseBody::Done(vec![]);
                     let _ = done_sender.send(Data::Cancelled);
-                    return future::ready(Err(std::io::Error::new(
+                    return Err(std::io::Error::new(
                         std::io::ErrorKind::Interrupted,
                         "Fetch aborted",
-                    )));
+                    ));
                 }
-                if let ResponseBody::Receiving(ref mut body) = *response_body_accumulator.lock() {
+
+                if let ResponseBody::Receiving(ref mut body) = *response_body.lock() {
                     body.extend_from_slice(&chunk);
                     let _ = done_sender.send(Data::Payload(chunk));
                 }
-                future::ready(Ok(response_body_accumulator))
-            })
-            .and_then(move |complete_response_body| {
-                debug!("successfully finished response for {:?}", url1);
-                let mut body = complete_response_body.lock();
+            }
+            Ok(())
+        }
+        .await;
+
+        match result {
+            Ok(_) => {
+                debug!("successfully finished response for {:?}", url2);
+                let mut body = response_body2.lock();
                 let mut completed_body = match *body {
                     ResponseBody::Receiving(ref mut body) => std::mem::take(body),
                     _ => vec![],
@@ -2444,12 +2447,11 @@ async fn http_network_fetch(
                 );
                 timing_ptr2.set_attribute(ResourceAttribute::ResponseEnd);
                 let _ = done_sender2.send(Data::Done);
-                future::ready(Ok(()))
-            })
-            .map_err(move |error| {
+            },
+            Err(error) => {
                 if let std::io::ErrorKind::InvalidData = error.kind() {
                     debug!("Content decompression error for {:?}", url2);
-                    let _ = done_sender3.send(Data::Error(NetworkError::DecompressionError));
+                    let _ = done_sender2.send(Data::Error(NetworkError::DecompressionError));
                     let mut body = response_body2.lock();
 
                     *body = ResponseBody::Done(vec![]);
@@ -2461,10 +2463,11 @@ async fn http_network_fetch(
                     _ => vec![],
                 };
                 *body = ResponseBody::Done(completed_body);
-                timing_ptr3.set_attribute(ResourceAttribute::ResponseEnd);
-                let _ = done_sender3.send(Data::Done);
-            }),
-    );
+                timing_ptr2.set_attribute(ResourceAttribute::ResponseEnd);
+                let _ = done_sender2.send(Data::Done);
+            },
+        }
+    });
 
     // TODO these substeps aren't possible yet
     // Substep 1
