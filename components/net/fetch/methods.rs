@@ -42,6 +42,7 @@ use serde::{Deserialize, Serialize};
 use servo_base::generic_channel::CallbackSetter;
 use servo_base::id::PipelineId;
 use servo_url::{Host, ServoUrl};
+use tokio::sync::futures::OwnedNotified;
 use tokio::sync::mpsc::{UnboundedReceiver as TokioReceiver, UnboundedSender as TokioSender};
 use tokio::sync::{Mutex as TokioMutex, Notify};
 
@@ -105,6 +106,7 @@ pub struct FetchContext {
     pub file_token: FileTokenCheck,
     pub request_interceptor: Arc<TokioMutex<RequestInterceptor>>,
     pub cancellation_listener: Arc<CancellationListener>,
+    pub backpressure_listener: Arc<Mutex<Option<TokioReceiver<u64>>>>,
     pub protocols: Arc<ProtocolRegistry>,
     pub websocket_chan: Option<Arc<Mutex<WebSocketChannel>>>,
     pub ca_certificates: CACertificates<'static>,
@@ -116,7 +118,7 @@ pub struct FetchContext {
 #[derive(Default)]
 pub struct CancellationListener {
     cancelled: AtomicBool,
-    notify: Notify,
+    notify: Arc<Notify>,
 }
 
 impl CancellationListener {
@@ -124,11 +126,11 @@ impl CancellationListener {
         self.cancelled.load(Ordering::Relaxed)
     }
 
-    pub(crate) async fn wait_for_cancellation(&self) {
-        let future = self.notify.notified();
-        if !self.cancelled() {
-            future.await;
-        }
+    /// Returns a Tokio OwnedNotified which completes on subsequent polls after cancellation.
+    /// Important: This future does NOT complete if cancellation takes place before the first
+    /// poll or before being enabled.
+    pub(crate) fn cancellation_notified(self: Arc<Self>) -> OwnedNotified {
+        self.notify.clone().notified_owned()
     }
 
     pub(crate) fn cancel(&self) {

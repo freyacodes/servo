@@ -4,6 +4,7 @@
 
 use std::collections::HashSet;
 use std::iter::FromIterator;
+use std::pin::Pin;
 use std::sync::Arc as StdArc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
@@ -42,8 +43,8 @@ use net_traits::http_status::HttpStatus;
 use net_traits::policy_container::{EmbedderPolicyValue, RequestPolicyContainer};
 use net_traits::pub_domains::{is_same_site, reg_suffix};
 use net_traits::request::{
-    BodyChunkRequest, BodyChunkResponse, CacheMode, CredentialsMode, Destination, Initiator,
-    Origin, RedirectMode, Referrer, Request, RequestBuilder, RequestClient, RequestMode,
+    BackpressureMode, BodyChunkRequest, BodyChunkResponse, CacheMode, CredentialsMode, Destination,
+    Initiator, Origin, RedirectMode, Referrer, Request, RequestBuilder, RequestClient, RequestMode,
     ResponseTainting, ServiceWorkersMode, TraversableForUserPrompts, get_cors_unsafe_header_names,
     is_cors_non_wildcard_request_header_name, is_cors_safelisted_method,
     is_cors_safelisted_request_header,
@@ -66,6 +67,7 @@ use servo_base::generic_channel::GenericSharedMemory;
 use servo_base::id::HistoryStateId;
 use servo_config::pref;
 use servo_url::{ImmutableOrigin, ServoUrl};
+use tokio::sync::futures::OwnedNotified;
 use tokio::sync::mpsc::{
     Receiver as TokioReceiver, Sender as TokioSender, UnboundedReceiver, UnboundedSender, channel,
     unbounded_channel,
@@ -2397,6 +2399,34 @@ async fn http_network_fetch(
     *response_body.lock() = ResponseBody::Receiving(Vec::with_capacity(prealloc_size));
     let response_body2 = response_body.clone();
 
+    struct BackpressureState {
+        cancellation_notified: Pin<Box<OwnedNotified>>,
+        backpressure_receiver: UnboundedReceiver<u64>,
+        byte_limit: u64,
+        bytes_received: u64,
+        backpressure_acknowledged_by_target: bool,
+    }
+
+    // Todo: Check that taking does not break redirects
+    let mut backpressure_state: Option<BackpressureState> = match (
+        context.backpressure_listener.lock().take(),
+        request.backpressure_mode,
+    ) {
+        (Some(backpressure_receiver), BackpressureMode::Controlled { initial_bytes }) => {
+            let mut cancellation_notified =
+                Box::pin(cancellation_listener.clone().cancellation_notified());
+            cancellation_notified.as_mut().enable();
+            Some(BackpressureState {
+                cancellation_notified,
+                backpressure_receiver,
+                byte_limit: initial_bytes,
+                bytes_received: 0,
+                backpressure_acknowledged_by_target: false,
+            })
+        },
+        _ => None,
+    };
+
     spawn_task(async move {
         let mut body_stream = response_stream.into_body();
 
@@ -2411,9 +2441,46 @@ async fn http_network_fetch(
                     ));
                 }
 
+                if let Some(backpressure) = backpressure_state.as_mut() {
+                    backpressure.bytes_received += chunk.len() as u64;
+                }
+
                 if let ResponseBody::Receiving(ref mut body) = *response_body.lock() {
                     body.extend_from_slice(&chunk);
                     let _ = done_sender.send(Data::Payload(chunk));
+                }
+
+                if let Some(backpressure) = backpressure_state.as_mut() {
+                    while backpressure.bytes_received >= backpressure.byte_limit {
+                        let abort_reason: Option<&str> = tokio::select! {
+                            biased;
+                            new_limit = backpressure.backpressure_receiver.recv() => {
+                                match new_limit {
+                                    Some(new_limit) => {
+                                        backpressure.byte_limit = new_limit;
+                                        backpressure.backpressure_acknowledged_by_target = true;
+                                        None
+                                    },
+                                    None => Some("Fetch aborted (backpressure sender dropped)")
+                                }
+                            }
+                            _ = (&mut backpressure.cancellation_notified) => {
+                                Some("Fetch aborted")
+                            }
+                            _ = tokio::time::sleep(Duration::from_secs(30)), if !backpressure.backpressure_acknowledged_by_target => {
+                                Some("Fetch aborted (target never acknowledged backpressure)")
+                            }
+                        };
+
+                        if let Some(abort_reason) = abort_reason {
+                            *response_body.lock() = ResponseBody::Done(vec![]);
+                            let _ = done_sender.send(Data::Cancelled);
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::Interrupted,
+                                abort_reason,
+                            ));
+                        }
+                    }
                 }
             }
             Ok(())
