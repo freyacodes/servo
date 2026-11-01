@@ -489,6 +489,16 @@ pub enum EmbedderMsg {
         ProtocolHandlerUpdateRegistration,
         GenericSender<AllowOrDeny>,
     ),
+    /// Asks the embedder what to do with a navigation after the MIME type has been determined
+    /// Currently, the only option is whether to continue or abort navigation. Initiating a download
+    /// from the existing fetch will be supported in the future.
+    RequestNavigationResponseDisposition {
+        webview_id: WebViewId,
+        /// Serialized form of the MIME type for the resource header
+        /// https://mimesniff.spec.whatwg.org/#serializing-a-mime-type
+        mime_string: String,
+        reply_channel: GenericCallback<AllowOrDeny>,
+    },
     /// Wether or not to unload a document
     AllowUnload(WebViewId, GenericSender<AllowOrDeny>),
     /// Inform embedder to clear the clipboard

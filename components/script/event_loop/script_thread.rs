@@ -44,7 +44,7 @@ use devtools_traits::{
 };
 use embedder_traits::user_contents::{UserContentManagerId, UserContents, UserScript};
 use embedder_traits::{
-    EmbedderControlId, EmbedderControlResponse, EmbedderMsg, FocusSequenceNumber,
+    AllowOrDeny, EmbedderControlId, EmbedderControlResponse, EmbedderMsg, FocusSequenceNumber,
     InputEventOutcome, JavaScriptEvaluationError, JavaScriptEvaluationId, MediaSessionActionType,
     ViewportDetails, WebDriverScriptCommand,
 };
@@ -69,8 +69,8 @@ use net_traits::pub_domains::is_same_site;
 use net_traits::request::{Referrer, RequestId};
 use net_traits::response::ResponseInit;
 use net_traits::{
-    FetchMetadata, FetchResponseMsg, Metadata, NetworkError, ResourceFetchTiming, ResourceThreads,
-    ResourceTimingType,
+    CoreResourceMsg, FetchMetadata, FetchResponseMsg, Metadata, NetworkError, ResourceFetchTiming,
+    ResourceThreads, ResourceTimingType,
 };
 use paint_api::{CrossProcessPaintApi, PinchZoomInfos, PipelineExitSource};
 use percent_encoding::percent_decode;
@@ -85,7 +85,7 @@ use script_traits::{
 };
 use servo_arc::Arc as ServoArc;
 use servo_base::cross_process_instant::CrossProcessInstant;
-use servo_base::generic_channel::GenericSender;
+use servo_base::generic_channel::{GenericCallback, GenericSender};
 use servo_base::id::{
     BrowsingContextId, HistoryStateId, PipelineId, PipelineNamespace, ScriptEventLoopId,
     ServiceWorkerId, WebViewId, WorkerId,
@@ -193,7 +193,26 @@ pub(crate) fn with_script_thread<R: Default>(f: impl FnOnce(&ScriptThread) -> R)
 // which can trigger GC, and so we can end up tracing the script
 // thread during parsing. For this reason, we don't trace the
 // incomplete parser contexts during GC.
-pub(crate) struct IncompleteParserContexts(RefCell<Vec<(PipelineId, ParserContext)>>);
+pub(crate) struct IncompleteParserContexts(
+    RefCell<Vec<(PipelineId, ParserContext, ParserDeferralStatus)>>,
+);
+
+#[derive(Default, Debug)]
+enum ParserDeferralStatus {
+    #[default]
+    AwaitingResourceHeader,
+    AwaitingEmbedderResponsePolicy {
+        mime_type: mime::Mime,
+        eof_if_reached: Option<Box<ParserDeferredEof>>,
+    },
+    DeferralComplete,
+}
+
+#[derive(Debug)]
+struct ParserDeferredEof {
+    result: Result<(), NetworkError>,
+    timing: ResourceFetchTiming,
+}
 
 unsafe_no_jsmanaged_fields!(TaskQueue<MainThreadScriptMsg>);
 
@@ -2139,6 +2158,17 @@ impl ScriptThread {
                 response,
             ) => {
                 self.handle_embedder_control_response(cx, control_id, response);
+            },
+            MainThreadScriptMsg::ReceiveNavigationResponseDisposition(
+                pipeline_id,
+                request_id,
+                disposition,
+            ) => {
+                self.handle_response_disposition_from_embedder(
+                    pipeline_id,
+                    request_id,
+                    disposition,
+                );
             },
         }
     }
@@ -4180,10 +4210,11 @@ impl ScriptThread {
             incomplete.target_snapshot_params,
             source_origin,
         );
-        self.incomplete_parser_contexts
-            .0
-            .borrow_mut()
-            .push((incomplete.pipeline_id, context));
+        self.incomplete_parser_contexts.0.borrow_mut().push((
+            incomplete.pipeline_id,
+            context,
+            Default::default(),
+        ));
 
         let request_builder = incomplete.request_builder();
         incomplete.controller = FetchController::new(
@@ -4242,8 +4273,8 @@ impl ScriptThread {
         let mut incomplete_parser_contexts = self.incomplete_parser_contexts.0.borrow_mut();
         let parser = incomplete_parser_contexts
             .iter_mut()
-            .find(|&&mut (pipeline_id, _)| pipeline_id == id);
-        if let Some(&mut (_, ref mut ctxt)) = parser {
+            .find(|&&mut (pipeline_id, _, _)| pipeline_id == id);
+        if let Some(&mut (_, ref mut ctxt, _)) = parser {
             ctxt.process_response(self, cx, fetch_metadata);
         }
     }
@@ -4252,8 +4283,8 @@ impl ScriptThread {
         let mut incomplete_parser_contexts = self.incomplete_parser_contexts.0.borrow_mut();
         let parser = incomplete_parser_contexts
             .iter_mut()
-            .find(|&&mut (parser_pipeline_id, _)| parser_pipeline_id == pipeline_id);
-        if let Some(&mut (_, ref mut ctxt)) = parser {
+            .find(|&&mut (parser_pipeline_id, _, _)| parser_pipeline_id == pipeline_id);
+        if let Some(&mut (_, ref mut ctxt, _)) = parser {
             ctxt.process_response_chunk(cx, chunk);
         }
     }
@@ -4271,10 +4302,10 @@ impl ScriptThread {
             .0
             .borrow()
             .iter()
-            .position(|&(pipeline_id, _)| pipeline_id == id);
+            .position(|&(pipeline_id, _, _)| pipeline_id == id);
 
         if let Some(idx) = idx {
-            let (_, context) = self.incomplete_parser_contexts.0.borrow_mut().remove(idx);
+            let (_, context, _) = self.incomplete_parser_contexts.0.borrow_mut().remove(idx);
 
             // we need to register an iframe entry to the performance timeline if present
             if let Some(window_proxy) = context
@@ -4300,7 +4331,7 @@ impl ScriptThread {
                 );
             }
 
-            context.process_response_eof(cx, eof, timing);
+            context.process_response_eof(cx, eof, timing, None);
         }
     }
 
@@ -4314,8 +4345,8 @@ impl ScriptThread {
         let mut incomplete_parser_contexts = self.incomplete_parser_contexts.0.borrow_mut();
         let parser = incomplete_parser_contexts
             .iter_mut()
-            .find(|&&mut (parser_pipeline_id, _)| parser_pipeline_id == pipeline_id);
-        let Some(&mut (_, ref mut ctxt)) = parser else {
+            .find(|&&mut (parser_pipeline_id, _, _)| parser_pipeline_id == pipeline_id);
+        let Some(&mut (_, ref mut ctxt, _)) = parser else {
             return;
         };
         // We need to report violations for navigations in iframes in the parent page
@@ -4323,6 +4354,105 @@ impl ScriptThread {
         if let Some(global) = self.documents.borrow().find_global(pipeline_id) {
             global.report_csp_violations(cx, violations, None, None);
         }
+    }
+
+    fn request_response_disposition_from_embedder(
+        &self,
+        pipeline_id: PipelineId,
+        request_id: RequestId,
+        eof_data: Option<ParserDeferredEof>,
+    ) {
+        let mut incomplete_parser_contexts = self.incomplete_parser_contexts.0.borrow_mut();
+        let parser = incomplete_parser_contexts
+            .iter_mut()
+            .find(|&&mut (parser_pipeline_id, _, _)| parser_pipeline_id == pipeline_id);
+        let Some(&mut (_, ref ctxt, ref mut deferral_status)) = parser else {
+            return;
+        };
+
+        assert!(matches!(
+            deferral_status,
+            ParserDeferralStatus::AwaitingResourceHeader
+        ));
+
+        let mime_type = ctxt.classify_mime_type();
+        let self_channel = self.senders.self_sender.clone();
+        let reply_channel = GenericCallback::new(move |disposition| match disposition {
+            Ok(disposition) => self_channel
+                .send(MainThreadScriptMsg::ReceiveNavigationResponseDisposition(
+                    pipeline_id,
+                    request_id,
+                    disposition,
+                ))
+                .unwrap(),
+            Err(error) => {
+                // The embedder is expected to communicate with us before dropping the callback
+                warn!("Failed to get response disposition from embedder {}", error)
+            },
+        })
+        .expect("Failed to create callback.");
+
+        self.senders
+            .pipeline_to_embedder_sender
+            .send(EmbedderMsg::RequestNavigationResponseDisposition {
+                webview_id: ctxt.webview_id(),
+                mime_string: mime_type.to_string(),
+                reply_channel,
+            })
+            .expect("Failed to send to embedder.");
+
+        *deferral_status = ParserDeferralStatus::AwaitingEmbedderResponsePolicy {
+            mime_type,
+            eof_if_reached: eof_data.map(Box::new),
+        }
+    }
+
+    fn handle_response_disposition_from_embedder(
+        &self,
+        pipeline_id: PipelineId,
+        request_id: RequestId,
+        disposition: AllowOrDeny,
+    ) {
+        let mut incomplete_parser_contexts = self.incomplete_parser_contexts.0.borrow_mut();
+        let parser = incomplete_parser_contexts
+            .iter_mut()
+            .find(|&&mut (parser_pipeline_id, _, _)| parser_pipeline_id == pipeline_id);
+        let Some(&mut (_, ref ctxt, ref mut deferral_status)) = parser else {
+            return;
+        };
+
+        let deferred_state =
+            std::mem::replace(deferral_status, ParserDeferralStatus::DeferralComplete);
+        let ParserDeferralStatus::AwaitingEmbedderResponsePolicy {
+            mime_type,
+            eof_if_reached,
+        } = deferred_state
+        else {
+            panic!(
+                "Received disposition while in unexpected state: {:?}",
+                deferred_state
+            );
+        };
+
+        match disposition {
+            AllowOrDeny::Allow => {
+                self.resource_threads
+                    .core_thread
+                    .send(CoreResourceMsg::SetResponseBackpressure(
+                        request_id,
+                        u64::MAX,
+                    ))
+                    .unwrap();
+            },
+            AllowOrDeny::Deny => {
+                self.resource_threads
+                    .core_thread
+                    .send(CoreResourceMsg::Cancel(vec![request_id]))
+                    .unwrap();
+            },
+        }
+
+        // TODO: Update the parser
     }
 
     fn handle_navigation_redirect(&self, id: PipelineId, metadata: &Metadata) {
@@ -4429,6 +4559,7 @@ impl ScriptThread {
             cx,
             Ok(()),
             ResourceFetchTiming::new(ResourceTimingType::None),
+            None,
         );
     }
 
@@ -4474,6 +4605,7 @@ impl ScriptThread {
             cx,
             Ok(()),
             ResourceFetchTiming::new(ResourceTimingType::None),
+            None,
         );
     }
 

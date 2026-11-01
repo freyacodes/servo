@@ -590,6 +590,16 @@ impl ServoInner {
                     );
                 }
             },
+            EmbedderMsg::RequestNavigationResponseDisposition {
+                webview_id,
+                mime_string,
+                reply_channel,
+            } => {
+                if let Some(webview) = self.get_webview_handle(webview_id) {
+                    // TODO
+                    let _ = reply_channel.send(AllowOrDeny::Allow);
+                }
+            },
             EmbedderMsg::AllowUnload(webview_id, response_sender) => {
                 if let Some(webview) = self.get_webview_handle(webview_id) {
                     let request = AllowOrDenyRequest::new(
