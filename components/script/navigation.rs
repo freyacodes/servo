@@ -18,8 +18,8 @@ use js::context::JSContext;
 use net_traits::blob_url_store::UrlWithBlobClaim;
 use net_traits::fetch::fetch_controller::FetchController;
 use net_traits::request::{
-    CredentialsMode, InsecureRequestsPolicy, Origin, PreloadedResources, RedirectMode,
-    RequestBuilder, RequestClient, RequestMode,
+    BackpressureMode, CredentialsMode, InsecureRequestsPolicy, Origin, PreloadedResources,
+    RedirectMode, RequestBuilder, RequestClient, RequestMode,
 };
 use net_traits::response::ResponseInit;
 use net_traits::{
@@ -260,7 +260,10 @@ impl InProgressLoad {
         .redirect_mode(RedirectMode::Manual)
         .crash(self.load_data.crash.clone())
         .client(request_client)
-        .url_list(self.url_list.clone());
+        .url_list(self.url_list.clone())
+        .backpressure_mode(BackpressureMode::Controlled {
+            initial_bytes: 1445,
+        });
 
         request_builder.reload_navigation = self.load_data.reload_navigation;
         request_builder.history_navigation = self.load_data.history_navigation;
