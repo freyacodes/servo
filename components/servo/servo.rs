@@ -590,6 +590,23 @@ impl ServoInner {
                     );
                 }
             },
+            EmbedderMsg::RequestNavigationResponseDisposition {
+                webview_id,
+                url,
+                mime_string,
+                reply_channel,
+            } => {
+                if let Some(webview) = self.get_webview_handle(webview_id) {
+                    // TODO
+                    dbg!("Navigation with mime string: {}", mime_string);
+                    let policy = if url.as_str().contains("arbjerg.dev") {
+                        AllowOrDeny::Allow
+                    } else {
+                        AllowOrDeny::Deny
+                    };
+                    let _ = reply_channel.send(policy);
+                }
+            },
             EmbedderMsg::AllowUnload(webview_id, response_sender) => {
                 if let Some(webview) = self.get_webview_handle(webview_id) {
                     let request = AllowOrDenyRequest::new(
@@ -649,6 +666,7 @@ impl ServoInner {
                 }
             },
             EmbedderMsg::NotifyLoadStatusChanged(webview_id, load_status) => {
+                dbg!(load_status);
                 if let Some(webview) = self.get_webview_handle(webview_id) {
                     webview.set_load_status(load_status);
                 }

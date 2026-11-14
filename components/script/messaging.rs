@@ -12,9 +12,12 @@ use std::time::Instant;
 use crossbeam_channel::{Receiver, RecvTimeoutError, Select, SelectedOperation, SendError, Sender};
 #[cfg(feature = "devtools")]
 use devtools_traits::{DevtoolScriptControlMsg, ScriptToDevtoolsControlMsg};
-use embedder_traits::{EmbedderControlId, EmbedderControlResponse, ScriptToEmbedderChan};
+use embedder_traits::{
+    AllowOrDeny, EmbedderControlId, EmbedderControlResponse, ScriptToEmbedderChan,
+};
 use net_traits::FetchResponseMsg;
 use net_traits::image_cache::ImageCacheResponseMessage;
+use net_traits::request::RequestId;
 use profile_traits::mem::{self as profile_mem, OpaqueSender, ReportsChan};
 use profile_traits::time::{self as profile_time};
 use rustc_hash::FxHashSet;
@@ -136,6 +139,9 @@ impl MixedMessage {
                     control_id,
                     ..,
                 ) => Some(control_id.pipeline_id),
+                MainThreadScriptMsg::ReceiveNavigationResponseDisposition(pipeline_id, _, _) => {
+                    Some(*pipeline_id)
+                },
             },
             MixedMessage::FromImageCache(response) => match response {
                 ImageCacheResponseMessage::NotifyPendingImageLoadStatus(response) => {
@@ -180,6 +186,8 @@ pub(crate) enum MainThreadScriptMsg {
     /// The `FileManagerThread` has finished selecting files is forwarding the response to
     /// the main thread of this `ScriptThread`.
     ForwardEmbedderControlResponseFromFileManager(EmbedderControlId, EmbedderControlResponse),
+    /// The embedder telling us how to proceed with a navigation.
+    ReceiveNavigationResponseDisposition(PipelineId, RequestId, AllowOrDeny),
 }
 
 /// Common messages used to control the event loops in both the script, the worker, and the

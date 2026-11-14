@@ -961,7 +961,7 @@ struct NavigationParams {
     iframe_element_referrer_policy: ReferrerPolicy,
 }
 
-/// The context required for asynchronously fetching a document
+/// The context required for (usually asynchronously) fetching a document
 /// and parsing it progressively.
 pub(crate) struct ParserContext {
     /// The parser that initiated the request.
@@ -1038,6 +1038,14 @@ impl ParserContext {
         self.navigation_params.about_base_url = about_base_url;
     }
 
+    pub(crate) fn webview_id(&self) -> WebViewId {
+        self.webview_id
+    }
+
+    pub(crate) fn url(&self) -> ServoUrl {
+        self.url.clone()
+    }
+
     pub(crate) fn get_document(&self) -> Option<DomRoot<Document>> {
         self.parser
             .as_ref()
@@ -1046,6 +1054,10 @@ impl ParserContext {
 
     pub(crate) fn parent_info(&self) -> Option<PipelineId> {
         self.parent_info
+    }
+
+    pub(crate) fn has_1445_bytes_in_resource_header(&self) -> bool {
+        self.navigation_params.resource_header.len() >= 1445
     }
 
     /// <https://html.spec.whatwg.org/multipage/#creating-a-policy-container-from-a-fetch-response>
@@ -1117,7 +1129,19 @@ impl ParserContext {
         }
     }
 
+    pub(crate) fn classify_mime_type(&self) -> Mime {
+        let content_type = &self.navigation_params.content_type;
+        MimeClassifier::default().classify(
+            LoadContext::Browsing,
+            NoSniffFlag::Off,
+            ApacheBugFlag::from_content_type(content_type.as_ref()),
+            content_type,
+            &self.navigation_params.resource_header,
+        )
+    }
+
     /// <https://html.spec.whatwg.org/multipage/#loading-a-document>
+    /// Note: This function diverges from the spec because the document is not created here
     fn load_document(
         &mut self,
         cx: &mut JSContext,
@@ -1126,15 +1150,10 @@ impl ParserContext {
     ) {
         assert!(!self.has_loaded_document);
         self.has_loaded_document = true;
+
         // Step 1. Let type be the computed type of navigationParams's response.
-        let content_type = &self.navigation_params.content_type;
-        let mime_type = MimeClassifier::default().classify(
-            LoadContext::Browsing,
-            NoSniffFlag::Off,
-            ApacheBugFlag::from_content_type(content_type.as_ref()),
-            content_type,
-            &self.navigation_params.resource_header,
-        );
+        let mime_type = self.classify_mime_type();
+
         // Step 2. If the user agent has been configured to process resources of the given type using
         // some mechanism other than rendering the content in a navigable, then skip this step.
         // Otherwise, if the type is one of the following types:
@@ -1626,9 +1645,9 @@ impl ParserContext {
         let Some(parser) = self.parser.as_ref().map(|p| p.root()) else {
             return;
         };
-        let Some(document) = self.document.as_ref().map(|document| document.root()) else {
+        if self.document.is_none() {
             return;
-        };
+        }
         if parser.aborted.get() {
             return;
         }
@@ -1637,10 +1656,6 @@ impl ParserContext {
             self.navigation_params
                 .resource_header
                 .extend_from_slice(payload.as_ref());
-            // the number of bytes in buffer is greater than or equal to 1445.
-            if self.navigation_params.resource_header.len() >= 1445 {
-                self.load_document(cx, Some(&parser), &document);
-            }
         } else {
             parser.parse_bytes_chunk(cx, payload.as_ref());
         }

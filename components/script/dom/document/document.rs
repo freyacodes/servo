@@ -277,6 +277,7 @@ pub(crate) enum AbortReason {
     Destroy,
     StopLoading,
     Navigate,
+    EmbedderResponseDisposition,
 }
 
 #[derive(Debug)]
