@@ -112,7 +112,8 @@ use crate::site_data_manager::{CookieOperationResponse, SiteDataManager};
 use crate::webview::{MINIMUM_WEBVIEW_SIZE, WebView, WebViewInner};
 use crate::webview_delegate::{
     AllowOrDenyRequest, AuthenticationRequest, BluetoothDeviceSelectionRequest, EmbedderControl,
-    FilePicker, NavigationRequest, PermissionRequest, ProtocolHandlerRegistration, WebResourceLoad,
+    FilePicker, NavigationRequest, PermissionRequest, ProtocolHandlerRegistration,
+    ResponseDispositionRequest, WebResourceLoad,
 };
 
 #[cfg(all(
@@ -597,14 +598,15 @@ impl ServoInner {
                 reply_channel,
             } => {
                 if let Some(webview) = self.get_webview_handle(webview_id) {
-                    // TODO
-                    dbg!("Navigation with mime string: {}", mime_string);
-                    let policy = if url.as_str().contains("arbjerg.dev") {
-                        AllowOrDeny::Allow
-                    } else {
-                        AllowOrDeny::Deny
+                    dbg!("Navigation with mime string", mime_string);
+                    let request = ResponseDispositionRequest {
+                        url: url.into_url(),
+                        callback: reply_channel,
+                        response_sent: false,
                     };
-                    let _ = reply_channel.send(policy);
+                    webview
+                        .delegate()
+                        .request_response_disposition(webview, request);
                 }
             },
             EmbedderMsg::AllowUnload(webview_id, response_sender) => {

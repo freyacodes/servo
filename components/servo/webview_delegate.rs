@@ -70,6 +70,32 @@ impl Drop for NavigationRequest {
     }
 }
 
+pub struct ResponseDispositionRequest {
+    pub url: Url,
+    pub(crate) callback: GenericCallback<AllowOrDeny>,
+    pub(crate) response_sent: bool,
+}
+
+impl ResponseDispositionRequest {
+    pub fn continue_navigation(mut self) {
+        let _ = self.callback.send(AllowOrDeny::Allow);
+        self.response_sent = true;
+    }
+
+    pub fn abort(mut self) {
+        let _ = self.callback.send(AllowOrDeny::Deny);
+        self.response_sent = true;
+    }
+}
+
+impl Drop for ResponseDispositionRequest {
+    fn drop(&mut self) {
+        if !self.response_sent {
+            let _ = self.callback.send(AllowOrDeny::Allow);
+        }
+    }
+}
+
 /// A permissions request for a [`WebView`]. The embedder should allow or deny the request,
 /// either by reading a cached value or querying the user for permission via the user
 /// interface.
@@ -988,6 +1014,14 @@ pub trait WebViewDelegate {
     /// Whether or not to allow a [`WebView`] to load a URL in its main frame or one of its
     /// nested `<iframe>`s. [`NavigationRequest`]s are accepted by default.
     fn request_navigation(&self, _webview: WebView, _navigation_request: NavigationRequest) {}
+
+    fn request_response_disposition(
+        &self,
+        _webview: WebView,
+        _request: ResponseDispositionRequest,
+    ) {
+    }
+
     /// Whether or not to allow a [`WebView`]  to unload a `Document` in its main frame or one
     /// of its nested `<iframe>`s. By default, unloads are allowed.
     fn request_unload(&self, _webview: WebView, _unload_request: AllowOrDenyRequest) {}
