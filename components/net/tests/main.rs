@@ -12,7 +12,7 @@ mod decoder;
 mod fetch;
 
 fn fetch(request: Request, dc: Option<Sender<DevtoolsControlMsg>>) -> Response {
-    fetch_with_context(request, &mut new_fetch_context(dc, None))
+    fetch_with_context(request, &mut new_fetch_context(dc, None, None))
 }
 mod file_loader;
 mod filemanager_thread;
@@ -32,7 +32,7 @@ use net::async_runtime::spawn_blocking_task;
 use net::connector::{CACertificates, create_http_client, create_tls_config};
 use net::embedder::NetToEmbedderMsg;
 use net::fetch::cors_cache::CorsCache;
-use net::fetch::methods::{self, FetchContext};
+use net::fetch::methods::{self, BackpressureListener, FetchContext};
 use net::filemanager_thread::FileManager;
 use net::protocols::ProtocolRegistry;
 use net::request_interceptor::RequestInterceptor;
@@ -130,6 +130,7 @@ fn create_http_state(fc: Option<GenericEmbedderProxy<NetToEmbedderMsg>>) -> Http
 fn new_fetch_context(
     devtools_chan: Option<Sender<DevtoolsControlMsg>>,
     fc: Option<GenericEmbedderProxy<NetToEmbedderMsg>>,
+    backpressure_listener: Option<BackpressureListener>,
 ) -> FetchContext {
     let sender = fc.unwrap_or_else(|| create_generic_embedder_proxy());
 
@@ -141,6 +142,7 @@ fn new_fetch_context(
         file_token: FileTokenCheck::NotRequired,
         request_interceptor: Arc::new(TokioMutex::new(RequestInterceptor::new(sender))),
         cancellation_listener: Arc::new(Default::default()),
+        backpressure_listener,
         protocols: Arc::new(ProtocolRegistry::with_internal_protocols()),
         websocket_chan: None,
         ca_certificates: CACertificates::Default,
@@ -178,7 +180,7 @@ fn fetch_with_cors_cache(request: Request, cache: &mut CorsCache) -> Response {
     let mut target = FetchResponseCollector {
         sender: Some(sender),
     };
-    let mut fetch_context = new_fetch_context(None, None);
+    let mut fetch_context = new_fetch_context(None, None, None);
     // Pre-seed the shared CORS cache in the context, then read it back after.
     *fetch_context.state.cors_cache.write() = cache.clone();
     let (response, new_cors_cache) = spawn_blocking_task(async move {

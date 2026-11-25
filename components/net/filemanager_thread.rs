@@ -250,7 +250,8 @@ impl FileManager {
                         );
                         let chunk = &buffer[0..offset];
                         body.extend_from_slice(chunk);
-                        let _ = done_sender.send(Data::Payload(Bytes::copy_from_slice(chunk)));
+                        let _ =
+                            done_sender.send(Data::Payload(Bytes::copy_from_slice(chunk), None));
                     }
                     buffer_len
                 };
@@ -319,7 +320,7 @@ impl FileManager {
                 let mut bytes = vec![];
                 bytes.extend_from_slice(buf.bytes.index(range));
 
-                let _ = done_sender.send(Data::Payload(Bytes::copy_from_slice(&bytes)));
+                let _ = done_sender.send(Data::Payload(Bytes::copy_from_slice(&bytes), None));
                 let _ = done_sender.send(Data::Done);
 
                 Ok(())

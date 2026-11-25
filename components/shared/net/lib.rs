@@ -311,6 +311,15 @@ pub trait FetchTaskTarget {
 
     /// Tell the listener that have a hint of how long the content is. This will be sent at most once.
     fn process_response_length_hint(&mut self, request_id: &Request, length: usize);
+
+    /// Servo internal. Called at most once per HTTP response when backpressure has been requested.
+    /// Returning true here means that this target takes responsibility for requesting more bytes.
+    /// Returning false will disable backpressure, where chunks are delivered as fast as possible.
+    ///
+    /// Returning true and failing to request more bytes may result in a deadlock.
+    fn accept_backpressure(&mut self) -> bool {
+        false
+    }
 }
 
 /// <https://fetch.spec.whatwg.org/#concept-filtered-response>
@@ -385,20 +394,29 @@ impl FetchMetadata {
     }
 }
 
-impl FetchTaskTarget for GenericCallback<FetchResponseMsg> {
+pub struct ChannelFetchTaskTarget {
+    pub sender: GenericCallback<FetchResponseMsg>,
+    pub expect_backpressure: bool,
+}
+
+impl FetchTaskTarget for ChannelFetchTaskTarget {
     fn process_request_body(&mut self, request: &Request) {
-        let _ = self.send(FetchResponseMsg::ProcessRequestBody(request.id));
+        let _ = self
+            .sender
+            .send(FetchResponseMsg::ProcessRequestBody(request.id));
     }
 
     fn process_response(&mut self, request: &Request, response: &Response) {
-        let _ = self.send(FetchResponseMsg::ProcessResponse(
+        let _ = self.sender.send(FetchResponseMsg::ProcessResponse(
             request.id,
             response.metadata(),
         ));
     }
 
     fn process_response_chunk(&mut self, request: &Request, chunk: bytes::Bytes) {
-        let _ = self.send(FetchResponseMsg::ProcessResponseChunk(request.id, chunk));
+        let _ = self
+            .sender
+            .send(FetchResponseMsg::ProcessResponseChunk(request.id, chunk));
     }
 
     fn process_response_eof(&mut self, request: &Request, response: &Response) {
@@ -407,19 +425,25 @@ impl FetchTaskTarget for GenericCallback<FetchResponseMsg> {
             .map_or_else(|| Ok(()), |network_error| Err(network_error.clone()));
         let timing = response.get_resource_timing().inner().clone();
 
-        let _ = self.send(FetchResponseMsg::ProcessResponseEOF(
+        let _ = self.sender.send(FetchResponseMsg::ProcessResponseEOF(
             request.id, result, timing,
         ));
     }
 
     fn process_csp_violations(&mut self, request: &Request, violations: Vec<csp::Violation>) {
-        let _ = self.send(FetchResponseMsg::ProcessCspViolations(
+        let _ = self.sender.send(FetchResponseMsg::ProcessCspViolations(
             request.id, violations,
         ));
     }
 
     fn process_response_length_hint(&mut self, request: &Request, length: usize) {
-        let _ = self.send(FetchResponseMsg::ProcessContentLength(request.id, length));
+        let _ = self
+            .sender
+            .send(FetchResponseMsg::ProcessContentLength(request.id, length));
+    }
+
+    fn accept_backpressure(&mut self) -> bool {
+        self.expect_backpressure
     }
 }
 
@@ -794,6 +818,8 @@ pub enum FetchChannels {
 pub enum CoreResourceMsg {
     Fetch(RequestBuilder, FetchChannels),
     Cancel(Vec<RequestId>),
+    /// Set the minimum number of bytes to be sent before response reading is suspended
+    SetResponseBackpressure(RequestId, u64),
     /// Initiate a fetch in response to processing a redirection
     FetchRedirect(
         RequestBuilder,

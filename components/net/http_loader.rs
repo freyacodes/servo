@@ -4,8 +4,9 @@
 
 use std::collections::HashSet;
 use std::iter::FromIterator;
-use std::sync::Arc as StdArc;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Arc as StdArc};
 use std::time::{Duration, SystemTime};
 
 use async_recursion::async_recursion;
@@ -44,8 +45,8 @@ use net_traits::http_status::HttpStatus;
 use net_traits::policy_container::{EmbedderPolicyValue, RequestPolicyContainer};
 use net_traits::pub_domains::{is_same_site, reg_suffix};
 use net_traits::request::{
-    BodyChunkRequest, BodyChunkResponse, CacheMode, CredentialsMode, Destination, Initiator,
-    Origin, RedirectMode, Referrer, Request, RequestBuilder, RequestClient, RequestMode,
+    BackpressureMode, BodyChunkRequest, BodyChunkResponse, CacheMode, CredentialsMode, Destination,
+    Initiator, Origin, RedirectMode, Referrer, Request, RequestBuilder, RequestClient, RequestMode,
     ResponseTainting, ServiceWorkersMode, TraversableForUserPrompts, get_cors_unsafe_header_names,
     is_cors_non_wildcard_request_header_name, is_cors_safelisted_method,
     is_cors_safelisted_request_header,
@@ -68,10 +69,12 @@ use servo_base::generic_channel::GenericSharedMemory;
 use servo_base::id::HistoryStateId;
 use servo_config::pref;
 use servo_url::{ImmutableOrigin, ServoUrl};
+use tokio::sync::futures::OwnedNotified;
 use tokio::sync::mpsc::{
     Receiver as TokioReceiver, Sender as TokioSender, UnboundedReceiver, UnboundedSender, channel,
     unbounded_channel,
 };
+use tokio::sync::oneshot;
 use tokio_stream::wrappers::ReceiverStream;
 #[cfg(feature = "tracing")]
 use tracing::Instrument;
@@ -96,7 +99,9 @@ use crate::embedder::NetToEmbedderMsg;
 use crate::fetch::cors_cache::CorsCache;
 use crate::fetch::fetch_params::FetchParams;
 use crate::fetch::headers::{SecFetchDest, SecFetchMode, SecFetchSite, SecFetchUser};
-use crate::fetch::methods::{Data, DoneChannel, FetchContext, Target, fetch, main_fetch};
+use crate::fetch::methods::{
+    BackpressureListener, Data, DoneChannel, FetchContext, Target, fetch, main_fetch,
+};
 use crate::hsts::HstsList;
 use crate::http_cache::{
     CacheKey, CachedResourcesOrGuard, HttpCache, ValidationStatus, construct_response,
@@ -1991,7 +1996,8 @@ fn spawn_stale_while_revalidate(
     // A background revalidation must not itself spin up service workers
     revalidation_request.service_workers_mode = ServiceWorkersMode::None;
 
-    let context = context.clone();
+    let mut context = context.clone();
+    context.backpressure_listener = Default::default(); // Disable backpressure
     debug!(
         "spawning stale-while-revalidate background revalidation for {:?}",
         revalidation_request.current_url()
@@ -2015,7 +2021,8 @@ async fn wait_for_inflight_requests(done_chan: &mut DoneChannel, response: &mut 
 
         loop {
             match ch.1.recv().await {
-                Some(Data::ContentLength(_)) | Some(Data::Payload(_)) | Some(Data::Error(_)) => {},
+                Some(Data::ContentLength(_)) | Some(Data::Payload(_, _)) | Some(Data::Error(_)) => {
+                },
                 Some(Data::Done) => break, // Return the full response as if it was initially cached as such.
                 Some(Data::Cancelled) => {
                     // The response was cancelled while the fetch was ongoing.
@@ -2385,11 +2392,8 @@ async fn http_network_fetch(
     };
 
     let done_sender2 = done_sender.clone();
-    let done_sender3 = done_sender.clone();
     let timing_ptr2 = fetch_params.timing_info.clone();
-    let timing_ptr3 = fetch_params.timing_info.clone();
-    let url1 = request.url();
-    let url2 = url1.clone();
+    let url2 = request.url();
 
     let prealloc_size: usize = if let Some(possible_length) = response_stream
         .headers()
@@ -2415,27 +2419,113 @@ async fn http_network_fetch(
     *response_body.lock() = ResponseBody::Receiving(Vec::with_capacity(prealloc_size));
     let response_body2 = response_body.clone();
 
-    spawn_task(
-        response_stream
-            .into_body()
-            .try_fold(response_body, move |response_body_accumulator, chunk| {
+    struct BackpressureState {
+        cancellation_notified: Pin<Box<OwnedNotified>>,
+        backpressure_receiver: BackpressureListener,
+        byte_limit: u64,
+        bytes_received: u64,
+        guard: Option<BackpressureGuard>,
+        guard_receiver: oneshot::Receiver<()>,
+    }
+
+    let mut backpressure_state: Option<BackpressureState> =
+        if let (Some(backpressure_receiver), BackpressureMode::Controlled { initial_bytes }) = (
+            context.backpressure_listener.as_ref(),
+            request.backpressure_mode,
+        ) {
+            let cancellation_notified =
+                Box::pin(cancellation_listener.clone().cancellation_notified());
+
+            let (guard, guard_receiver) = BackpressureGuard::new();
+
+            Some(BackpressureState {
+                cancellation_notified,
+                backpressure_receiver: backpressure_receiver.clone(),
+                byte_limit: initial_bytes,
+                bytes_received: 0,
+                guard: Some(guard),
+                guard_receiver,
+            })
+        } else {
+            None
+        };
+
+    spawn_task(async move {
+        let mut body_stream = response_stream.into_body();
+
+        let result: Result<(), std::io::Error> = async move {
+            while let Some(chunk) = body_stream.try_next().await? {
                 if cancellation_listener.cancelled() {
-                    *response_body_accumulator.lock() = ResponseBody::Done(vec![]);
+                    *response_body.lock() = ResponseBody::Done(vec![]);
                     let _ = done_sender.send(Data::Cancelled);
-                    return future::ready(Err(std::io::Error::new(
+                    return Err(std::io::Error::new(
                         std::io::ErrorKind::Interrupted,
                         "Fetch aborted",
-                    )));
+                    ));
                 }
-                if let ResponseBody::Receiving(ref mut body) = *response_body_accumulator.lock() {
+
+                if let Some(backpressure) = backpressure_state.as_mut() {
+                    backpressure.bytes_received += chunk.len() as u64;
+                }
+
+                if let ResponseBody::Receiving(ref mut body) = *response_body.lock() {
                     body.extend_from_slice(&chunk);
-                    let _ = done_sender.send(Data::Payload(chunk));
+                    let guard = backpressure_state
+                        .as_mut()
+                        .and_then(|s| s.guard.take());
+                    let _ = done_sender.send(Data::Payload(chunk, guard));
                 }
-                future::ready(Ok(response_body_accumulator))
-            })
-            .and_then(move |complete_response_body| {
-                debug!("successfully finished response for {:?}", url1);
-                let mut body = complete_response_body.lock();
+
+                if let Some(backpressure) = backpressure_state.as_mut() {
+                    while backpressure.bytes_received >= backpressure.byte_limit {
+                        let abort_reason: Option<&str> = tokio::select! {
+                            biased;
+                            new_limit = backpressure.backpressure_receiver.changed() => {
+                                match new_limit {
+                                    Ok(_) => {
+                                        backpressure.byte_limit = *backpressure.backpressure_receiver
+                                            .borrow_and_update();
+                                        None
+                                    },
+                                    Err(_) => Some("Bbackpressure sender closed (should not happen)")
+                                }
+                            }
+                            _ = (&mut backpressure.cancellation_notified) => {
+                                Some("Fetch aborted")
+                            }
+                            result = (&mut backpressure.guard_receiver), if !backpressure.guard_receiver.is_terminated() => {
+                                if result.is_ok() {
+                                    // Target did not accept responsibility when presented with the first chunk
+                                    backpressure.byte_limit = u64::MAX;
+                                }
+                                None
+                            }
+                            _ = done_sender.closed() => {
+                                // No point in backpressure if there is no receiver
+                                backpressure.byte_limit = u64::MAX;
+                                None
+                            }
+                        };
+
+                        if let Some(abort_reason) = abort_reason {
+                            *response_body.lock() = ResponseBody::Done(vec![]);
+                            let _ = done_sender.send(Data::Cancelled);
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::Interrupted,
+                                abort_reason,
+                            ));
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
+        .await;
+
+        match result {
+            Ok(_) => {
+                debug!("successfully finished response for {:?}", url2);
+                let mut body = response_body2.lock();
                 let mut completed_body = match *body {
                     ResponseBody::Receiving(ref mut body) => std::mem::take(body),
                     _ => vec![],
@@ -2467,12 +2557,11 @@ async fn http_network_fetch(
                 );
                 timing_ptr2.set_attribute(ResourceAttribute::ResponseEnd);
                 let _ = done_sender2.send(Data::Done);
-                future::ready(Ok(()))
-            })
-            .map_err(move |error| {
+            },
+            Err(error) => {
                 if let std::io::ErrorKind::InvalidData = error.kind() {
                     debug!("Content decompression error for {:?}", url2);
-                    let _ = done_sender3.send(Data::Error(NetworkError::DecompressionError));
+                    let _ = done_sender2.send(Data::Error(NetworkError::DecompressionError));
                     let mut body = response_body2.lock();
 
                     *body = ResponseBody::Done(vec![]);
@@ -2484,10 +2573,11 @@ async fn http_network_fetch(
                     _ => vec![],
                 };
                 *body = ResponseBody::Done(completed_body);
-                timing_ptr3.set_attribute(ResourceAttribute::ResponseEnd);
-                let _ = done_sender3.send(Data::Done);
-            }),
-    );
+                timing_ptr2.set_attribute(ResourceAttribute::ResponseEnd);
+                let _ = done_sender2.send(Data::Done);
+            },
+        }
+    });
 
     // TODO these substeps aren't possible yet
     // Substep 1
@@ -2530,6 +2620,35 @@ async fn http_network_fetch(
     // Ensure we don't override "responseEnd" on successful return of this function
     response_end_timer.neuter();
     response
+}
+
+#[derive(Clone)]
+pub struct BackpressureGuard {
+    arc: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+}
+
+impl BackpressureGuard {
+    fn new() -> (Self, oneshot::Receiver<()>) {
+        let (sender, receiver) = oneshot::channel();
+        (
+            Self {
+                arc: Arc::new(Mutex::new(Some(sender))),
+            },
+            receiver,
+        )
+    }
+
+    pub fn disarm(self) {
+        *self.arc.lock() = None;
+    }
+}
+
+impl Drop for BackpressureGuard {
+    fn drop(&mut self) {
+        if let Some(sender) = Arc::get_mut(&mut self.arc).and_then(|m| m.lock().take()) {
+            let _ = sender.send(());
+        }
+    }
 }
 
 /// [CORS preflight fetch](https://fetch.spec.whatwg.org#cors-preflight-fetch)

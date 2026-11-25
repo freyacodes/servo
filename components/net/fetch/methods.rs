@@ -42,8 +42,9 @@ use serde::{Deserialize, Serialize};
 use servo_base::generic_channel::CallbackSetter;
 use servo_base::id::PipelineId;
 use servo_url::{Host, ImmutableOrigin, ServoUrl};
-use tokio::sync::Mutex as TokioMutex;
+use tokio::sync::futures::OwnedNotified;
 use tokio::sync::mpsc::{UnboundedReceiver as TokioReceiver, UnboundedSender as TokioSender};
+use tokio::sync::{Mutex as TokioMutex, Notify, watch};
 
 use crate::connector::CACertificates;
 #[cfg(feature = "devtools")]
@@ -55,16 +56,18 @@ use crate::fetch::fetch_params::{
     ConsumePreloadedResources, FetchParams, SharedPreloadedResources,
 };
 use crate::filemanager_thread::FileManager;
-use crate::http_loader::{HttpState, determine_requests_referrer, http_fetch, set_default_accept};
+use crate::http_loader::{
+    BackpressureGuard, HttpState, determine_requests_referrer, http_fetch, set_default_accept,
+};
 use crate::protocols::{ProtocolRegistry, is_url_potentially_trustworthy};
 use crate::request_interceptor::RequestInterceptor;
 use crate::subresource_integrity::is_response_integrity_valid;
 
 pub type Target<'a> = &'a mut (dyn FetchTaskTarget + Send);
 
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone)]
 pub enum Data {
-    Payload(bytes::Bytes),
+    Payload(bytes::Bytes, Option<BackpressureGuard>),
     ContentLength(usize),
     Done,
     Cancelled,
@@ -106,6 +109,7 @@ pub struct FetchContext {
     pub file_token: FileTokenCheck,
     pub request_interceptor: Arc<TokioMutex<RequestInterceptor>>,
     pub cancellation_listener: Arc<CancellationListener>,
+    pub backpressure_listener: Option<BackpressureListener>,
     pub protocols: Arc<ProtocolRegistry>,
     pub websocket_chan: Option<Arc<Mutex<WebSocketChannel>>>,
     pub ca_certificates: CACertificates<'static>,
@@ -114,9 +118,12 @@ pub struct FetchContext {
     pub in_flight_keep_alive_records: SharedInflightKeepAliveRecords,
 }
 
+pub type BackpressureListener = watch::Receiver<u64>;
+
 #[derive(Default)]
 pub struct CancellationListener {
     cancelled: AtomicBool,
+    notify: Arc<Notify>,
 }
 
 impl CancellationListener {
@@ -124,8 +131,16 @@ impl CancellationListener {
         self.cancelled.load(Ordering::Relaxed)
     }
 
+    /// Returns a Tokio OwnedNotified which completes on subsequent polls after cancellation.
+    /// Important: This future does NOT complete if cancellation takes place before the first
+    /// poll or before being enabled.
+    pub(crate) fn cancellation_notified(self: Arc<Self>) -> OwnedNotified {
+        self.notify.clone().notified_owned()
+    }
+
     pub(crate) fn cancel(&self) {
-        self.cancelled.store(true, Ordering::Relaxed)
+        self.cancelled.store(true, Ordering::Relaxed);
+        self.notify.notify_waiters();
     }
 }
 
@@ -916,7 +931,12 @@ async fn wait_for_response(
                 Some(Data::ContentLength(length)) => {
                     target.process_response_length_hint(request, length);
                 },
-                Some(Data::Payload(bytes)) => {
+                Some(Data::Payload(bytes, backpressure_guard)) => {
+                    if let Some(guard) = backpressure_guard &&
+                        target.accept_backpressure()
+                    {
+                        guard.disarm();
+                    }
                     #[cfg(feature = "devtools")]
                     if let Some(body) = devtools_body.as_mut() {
                         body.append_chunk(&bytes);

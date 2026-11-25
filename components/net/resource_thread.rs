@@ -20,12 +20,14 @@ use malloc_size_of_derive::MallocSizeOf;
 use net_traits::blob_url_store::{BlobTokenCommunicator, parse_blob_url};
 use net_traits::filemanager_thread::FileTokenCheck;
 use net_traits::pub_domains::public_suffix_list_size_of;
-use net_traits::request::{Destination, PreloadEntry, PreloadId, RequestBuilder, RequestId};
+use net_traits::request::{
+    BackpressureMode, Destination, PreloadEntry, PreloadId, RequestBuilder, RequestId,
+};
 use net_traits::response::{Response, ResponseInit};
 use net_traits::{
-    AsyncRuntime, CookieData, CookieSource, CoreResourceMsg, CoreResourceThread,
-    CustomResponseMediator, DiscardFetch, FetchChannels, FetchTaskTarget, NetworkError,
-    ResourceFetchTiming, ResourceThreads, ResourceTimingType, WebSocketDomAction,
+    AsyncRuntime, ChannelFetchTaskTarget, CookieData, CookieSource, CoreResourceMsg,
+    CoreResourceThread, CustomResponseMediator, DiscardFetch, FetchChannels, FetchTaskTarget,
+    NetworkError, ResourceFetchTiming, ResourceThreads, ResourceTimingType, WebSocketDomAction,
     WebSocketNetworkEvent,
 };
 use parking_lot::{Mutex, RwLock};
@@ -45,7 +47,7 @@ use servo_base::generic_channel::{
     GenericSender,
 };
 use servo_url::{ImmutableOrigin, ServoUrl};
-use tokio::sync::Mutex as TokioMutex;
+use tokio::sync::{Mutex as TokioMutex, watch};
 
 use crate::async_runtime::{init_async_runtime, spawn_task};
 use crate::connector::{
@@ -57,7 +59,7 @@ use crate::embedder::NetToEmbedderMsg;
 use crate::fetch::cors_cache::CorsCache;
 use crate::fetch::fetch_params::{FetchParams, SharedPreloadedResources};
 use crate::fetch::methods::{
-    AutoRequestBodyStreamCloser, CancellationListener, FetchContext,
+    AutoRequestBodyStreamCloser, BackpressureListener, CancellationListener, FetchContext,
     SharedInflightKeepAliveRecords, WebSocketChannel, fetch,
     transfers_request_body_stream_to_later_manual_redirect,
 };
@@ -162,6 +164,7 @@ pub fn new_core_resource_thread(
                 ca_certificates,
                 ignore_certificate_errors,
                 cancellation_listeners: Default::default(),
+                backpressure_channels: Default::default(),
             };
 
             mem_profiler_chan.run_with_memory_reporting(
@@ -191,6 +194,7 @@ struct ResourceChannelManager {
     ca_certificates: CACertificates<'static>,
     ignore_certificate_errors: bool,
     cancellation_listeners: FxHashMap<RequestId, Weak<CancellationListener>>,
+    backpressure_channels: FxHashMap<RequestId, watch::Sender<u64>>,
 }
 
 /// This returns a tuple HttpState and a private HttpState.
@@ -386,6 +390,23 @@ impl ResourceChannelManager {
         cancellation_listener
     }
 
+    fn backpressure_sender(&self, request_id: RequestId) -> Option<&watch::Sender<u64>> {
+        self.backpressure_channels.get(&request_id)
+    }
+
+    fn create_backpressure_channel(
+        &mut self,
+        request_id: RequestId,
+        initial: u64,
+    ) -> watch::Receiver<u64> {
+        self.backpressure_channels
+            .retain(|_, sender| !sender.is_closed());
+
+        let (sender, receiver) = watch::channel(initial);
+        self.backpressure_channels.insert(request_id, sender);
+        receiver
+    }
+
     /// Returns false if the thread should exit.
     fn process_msg(
         &mut self,
@@ -398,12 +419,24 @@ impl ResourceChannelManager {
                 FetchChannels::ResponseMsg(sender) => {
                     let cancellation_listener =
                         self.get_or_create_cancellation_listener(request_builder.id);
+                    let backpressure_listener = match request_builder.backpressure_mode {
+                        BackpressureMode::Disabled => None,
+                        BackpressureMode::Controlled { initial_bytes } => Some(
+                            self.create_backpressure_channel(request_builder.id, initial_bytes),
+                        ),
+                    };
+                    let target = ChannelFetchTaskTarget {
+                        sender,
+                        expect_backpressure: backpressure_listener.is_some(),
+                    };
+
                     self.resource_manager.fetch(
                         request_builder,
                         None,
-                        sender,
+                        target,
                         http_state,
                         cancellation_listener,
+                        backpressure_listener,
                         protocols,
                     );
                 },
@@ -429,6 +462,7 @@ impl ResourceChannelManager {
                     DiscardFetch,
                     http_state,
                     Arc::new(Default::default()),
+                    None,
                     protocols,
                 ),
             },
@@ -438,6 +472,11 @@ impl ResourceChannelManager {
                     .filter_map(|request_id| self.cancellation_listener(request_id))
                 {
                     cancellation_listener.cancel();
+                }
+            },
+            CoreResourceMsg::SetResponseBackpressure(request_id, num_bytes) => {
+                if let Some(sender) = self.backpressure_sender(request_id) {
+                    let _ = sender.send(num_bytes);
                 }
             },
             CoreResourceMsg::DeleteCookiesForSites(sites, sender) => {
@@ -471,12 +510,24 @@ impl ResourceChannelManager {
             CoreResourceMsg::FetchRedirect(request_builder, res_init, sender) => {
                 let cancellation_listener =
                     self.get_or_create_cancellation_listener(request_builder.id);
+                let backpressure_listener = match request_builder.backpressure_mode {
+                    BackpressureMode::Disabled => None,
+                    BackpressureMode::Controlled { initial_bytes } => {
+                        Some(self.create_backpressure_channel(request_builder.id, initial_bytes))
+                    },
+                };
+                let target = ChannelFetchTaskTarget {
+                    sender,
+                    expect_backpressure: backpressure_listener.is_some(),
+                };
+
                 self.resource_manager.fetch(
                     request_builder,
                     Some(res_init),
-                    sender,
+                    target,
                     http_state,
                     cancellation_listener,
+                    backpressure_listener,
                     protocols,
                 )
             },
@@ -779,6 +830,7 @@ impl CoreResourceManager {
         }
     }
 
+    #[expect(clippy::too_many_arguments)]
     fn fetch<Target: 'static + FetchTaskTarget + Send>(
         &self,
         request_builder: RequestBuilder,
@@ -786,6 +838,7 @@ impl CoreResourceManager {
         mut sender: Target,
         http_state: &Arc<HttpState>,
         cancellation_listener: Arc<CancellationListener>,
+        backpressure_listener: Option<BackpressureListener>,
         protocols: Arc<ProtocolRegistry>,
     ) {
         let http_state = http_state.clone();
@@ -848,6 +901,7 @@ impl CoreResourceManager {
                 file_token,
                 request_interceptor: Arc::new(TokioMutex::new(request_interceptor)),
                 cancellation_listener,
+                backpressure_listener,
                 protocols,
                 websocket_chan: None,
                 ca_certificates,
@@ -945,6 +999,7 @@ impl CoreResourceManager {
                         file_token: FileTokenCheck::NotRequired,
                         request_interceptor: Arc::new(TokioMutex::new(request_interceptor)),
                         cancellation_listener,
+                        backpressure_listener: Default::default(),
                         protocols: protocols.clone(),
                         websocket_chan: Some(Arc::new(Mutex::new(WebSocketChannel::new(
                             event_sender.clone(),
